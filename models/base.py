@@ -162,7 +162,8 @@ class BasePipeline:
                 bias='none',
                 target_modules=target_linear_modules
             )
-        else:
+        # else:
+        elif adapter_type != 'video_id':
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
         self.peft_config = peft_config
         self.lora_model = peft.get_peft_model(self.transformer, peft_config)

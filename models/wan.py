@@ -16,6 +16,7 @@ from accelerate.utils import set_module_tensor_to_device
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 from utils.offloading import ModelOffloader
+from utils.common import is_main_process
 import wan
 from wan.modules.t5 import T5Encoder, T5Decoder, T5Model
 from wan.modules.tokenizers import HuggingfaceTokenizer
@@ -26,6 +27,9 @@ from wan.modules.model import (
 from wan.modules.clip import CLIPModel
 from wan import configs as wan_configs
 from safetensors.torch import load_file
+
+from .video_id_adapter import VideoIDAdapter
+
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
 
@@ -264,7 +268,8 @@ class WanAttentionBlock(nn.Module):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_id_tokens: bool = False,):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -286,6 +291,16 @@ class WanAttentionBlock(nn.Module):
                                                                       (-1, -1),
                                                                       qk_norm,
                                                                       eps)
+        
+        # 专用 cross-attn for ID-tokens
+        self.use_id_tokens = use_id_tokens
+        if self.use_id_tokens:
+            self.id_cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
+                dim, num_heads, (-1, -1), qk_norm, eps
+            )
+        else:
+            self.id_cross_attn = None
+        
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -303,6 +318,8 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        id_tokens=None,        # ← 新增
+        id_lens=None,          # ← 新增
     ):
         r"""
         Args:
@@ -321,13 +338,23 @@ class WanAttentionBlock(nn.Module):
         x = x + y * e[2]
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        # def cross_attn_ffn(x, context, context_lens, e):
+            # x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        def cross_attn_ffn(x, context, context_lens, id_tokens, id_lens, e):
+            # text cross-attn
+            y_txt = self.cross_attn(self.norm3(x), context, context_lens)
+            # id-token cross-attn
+            if self.id_cross_attn is not None and id_tokens is not None:
+                y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens)
+            else:
+                y_id = 0
+            x = x + y_txt + y_id
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             x = x + y * e[5]
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        # x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, id_tokens, id_lens, e)
         return x
 
 
@@ -437,6 +464,7 @@ class WanPipeline(BasePipeline):
             vae_pth=os.path.join(ckpt_dir, wan_config.vae_checkpoint),
             device='cpu',
         )
+        self.video_id_adapter = None
         # These need to be on the device the VAE will be moved to during caching.
         self.vae.mean = self.vae.mean.to('cuda')
         self.vae.std = self.vae.std.to('cuda')
@@ -480,6 +508,57 @@ class WanPipeline(BasePipeline):
         # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
         for name, p in self.transformer.named_parameters():
             p.original_name = name
+
+    # called from train.py  (same signature as BasePipeline)
+    def configure_adapter(self, adapter_config):
+        adapter_type = adapter_config['type']
+        if adapter_type == 'lora':
+            # 保持原有逻辑 – 调用父类
+            return super().configure_adapter(adapter_config)
+
+        if adapter_type != 'video_id':
+            raise NotImplementedError(f'Adapter type {adapter_type} not implemented.')
+
+        # 1) 构建 VideoIDAdapter
+        hidden = self.transformer.dim        # 5120 (14B) or 4096 (1.3B)
+        # 从 VAE 的 mean 向量推断潜空间通道数（Wan-VAE: 16）
+        latent_ch = int(self.vae.mean.shape[0]) if hasattr(self.vae, "mean") else 4
+        self.video_id_adapter = VideoIDAdapter(
+            hidden_size       = hidden,
+            num_id_tokens     = adapter_config.get('num_id_tokens', 16),
+            num_layers        = adapter_config.get('num_layers', 4),
+            num_heads         = adapter_config.get('num_heads', 16),
+            mlp_ratio         = adapter_config.get('mlp_ratio', 4),
+            dropout           = adapter_config.get('dropout', 0.0),
+            proj_in_channels  = latent_ch,
+        ).to(self.model_config['dtype'])
+
+        # 2) 冻结 Wan-Transformer
+        for p in self.transformer.parameters():
+            p.requires_grad_(False)
+
+        # 3) 把指定层打上 use_id_tokens=True 并加 id_cross_attn
+        inject_layers = adapter_config.get('layers', [])
+        for idx in inject_layers:
+            blk = self.transformer.blocks[idx]
+            if not getattr(blk, "use_id_tokens", False):
+                blk.use_id_tokens = True
+        # 拿同一个 CrossAttention 类直接实例化
+        cross_attn_cls = blk.cross_attn.__class__
+        blk.id_cross_attn = cross_attn_cls(
+            blk.dim,
+            blk.num_heads,
+            (-1, -1),
+            blk.qk_norm,
+            blk.eps,
+        ).to(                                       # 与原 cross-attn 对齐 dtype / device
+            blk.cross_attn.q.weight.device,
+            dtype=self.model_config["dtype"],      # 强制 bfloat16 / fp16
+        )
+
+        # 4) 把 Adapter 参数加入训练列表
+        for p in self.video_id_adapter.parameters():
+            p.requires_grad_(True)
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
@@ -602,9 +681,23 @@ class WanPipeline(BasePipeline):
 
         # timestep input to model needs to be in range [0, 1000]
         t = t * 1000
+        
+        # -------- Video-ID Adapter --------
+        if self.video_id_adapter is not None:
+            with torch.autocast(device_type=latents.device.type,
+                                dtype=self.model_config['dtype']):
+                id_tokens = self.video_id_adapter(x_1)        # [B, N, D]
+            id_lens = torch.full(
+                (bs,), id_tokens.size(1), dtype=torch.long,
+                device=id_tokens.device
+            )
+        else:
+            id_tokens, id_lens = None, None
 
         return (
-            (x_t, y, t, text_embeddings, seq_lens, clip_context),
+            # (x_t, y, t, text_embeddings, seq_lens, clip_context),
+            (x_t, y, t, text_embeddings, seq_lens, clip_context,
+             id_tokens, id_lens),
             (target, mask),
         )
 
@@ -665,8 +758,13 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
+                
+        if len(inputs) == 8:
+            x, y, t, context, text_seq_lens, clip_fea, id_tokens, id_lens = inputs
+        else:  # 旧路径 (无 adapter)
+            x, y, t, context, text_seq_lens, clip_fea = inputs
+            id_tokens, id_lens = None, None
 
-        x, y, t, context, text_seq_lens, clip_fea = inputs
         bs, channels, f, h, w = x.shape
         if clip_fea.numel() == 0:
             clip_fea = None
@@ -721,7 +819,7 @@ class InitialLayer(nn.Module):
         seq_lens = seq_lens.to(x.device)
         grid_sizes = grid_sizes.to(x.device)
 
-        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context)
+        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context, id_tokens, id_lens)
 
 
 class TransformerLayer(nn.Module):
@@ -733,13 +831,19 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
+        x, e, e0, seq_lens, grid_sizes, freqs, context, id_tokens, id_lens = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
+        # x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
+        x = self.block(
+            x, e0, seq_lens, grid_sizes, freqs, context, None,
+            id_tokens=id_tokens, id_lens=id_lens
+        )
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
+        # return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
+        return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs,
+                               context, id_tokens, id_lens)
 
 
 class FinalLayer(nn.Module):
@@ -753,7 +857,9 @@ class FinalLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
+        # drop id-tokens tuple elements
+        x, e, e0, seq_lens, grid_sizes, freqs, context, *_ = inputs
+
         x = self.head(x, e)
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x, dim=0)

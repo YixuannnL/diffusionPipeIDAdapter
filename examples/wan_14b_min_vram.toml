@@ -1,9 +1,9 @@
 # This configuration should allow you to train Wan 14b t2v on 512x512x81 sized videos (or varying aspect ratios of the same size), with 24GB VRAM.
 
 # change this
-output_dir = '/data/diffusion_pipe_training_runs/tmp'
+output_dir = '/data/bohong/diffusion-pipe/data/output'
 # and this
-dataset = '/home/anon/code/diffusion-pipe-configs/datasets/wan/video.toml'
+dataset = 'examples/dataset.toml'
 
 # training settings
 epochs = 1000
@@ -28,19 +28,26 @@ save_dtype = 'bfloat16'
 caching_batch_size = 1
 steps_per_print = 1
 video_clip_mode = 'single_beginning'
-blocks_to_swap = 32
+# blocks_to_swap = 32
 
 [model]
 type = 'wan'
-ckpt_path = '/data2/imagegen_models/Wan2.1-T2V-14B'
+ckpt_path = '/data/bohong/model/Wan2.1-T2V-14B'
 dtype = 'bfloat16'
 transformer_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
 
 [adapter]
-type = 'lora'
-rank = 32
-dtype = 'bfloat16'
+#type = 'lora'
+#rank = 32
+#dtype = 'bfloat16'
+type           = "video_id"
+num_id_tokens  = 16
+layers         = [12, 15, 18, 21]        # 对应 ConsisID 高频层
+num_layers     = 4
+num_heads      = 16
+mlp_ratio      = 4
+dropout        = 0.0
 
 [optimizer]
 type = 'AdamW8bitKahan'

@@ -112,6 +112,16 @@ def set_config_defaults(config):
             adapter_config.setdefault('dropout', 0.0)
             adapter_config.setdefault('dtype', model_dtype_str)
             adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+        elif adapter_type == 'video_id':            # ← 新增分支
+            # 这里只需要把 dtype 转成真正的 torch.dtype，其他参数留给各自模型处理
+            adapter_config.setdefault('dtype', model_dtype_str)
+            adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+            # 提供几个安全默认，便于 TOML 里省略
+            adapter_config.setdefault('num_id_tokens', 16)
+            adapter_config.setdefault('num_layers', 4)
+            adapter_config.setdefault('num_heads', 16)
+            adapter_config.setdefault('mlp_ratio', 4)
+            adapter_config.setdefault('dropout', 0.0)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
 
@@ -629,6 +639,16 @@ if __name__ == '__main__':
         optimizer=get_optimizer,
         config=ds_config,
     )
+    
+    if is_main_process():
+        trainables = [(n, p.numel()) for n, p in pipeline_model.named_parameters() if p.requires_grad]
+        total = sum(x[1] for x in trainables)
+        print(f"\n=== Trainable params ({total/1e6:.2f} M) ===")
+        for n, k in trainables:
+            print(f"{k/1e6:7.2f} M  {n}")
+    import pdb
+    pdb.set_trace()
+    
     model.model_engine = model_engine
     if model_engine.is_pipe_parallel:
          grid = model_engine.grid
