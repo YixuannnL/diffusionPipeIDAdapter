@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 import torch
 from torch import nn
 import torch.nn.functional as F
-import safetensors
+import safetensors, os
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
@@ -512,6 +512,7 @@ class WanPipeline(BasePipeline):
     # called from train.py  (same signature as BasePipeline)
     def configure_adapter(self, adapter_config):
         adapter_type = adapter_config['type']
+        self.adapter_type = adapter_type
         if adapter_type == 'lora':
             # 保持原有逻辑 – 调用父类
             return super().configure_adapter(adapter_config)
@@ -556,8 +557,15 @@ class WanPipeline(BasePipeline):
                     blk.cross_attn.q.weight.device,
                     dtype=self.model_config["dtype"],      # 强制 bfloat16 / fp16
                 )
+            # --- 给新建 cross-attn 的每个参数打 original_name ---
+            for n, p in blk.id_cross_attn.named_parameters():
+                p.original_name = f"blocks.{idx}.id_cross_attn.{n}"
+                
+        # 4) 给 Adapter 自身权重打 original_name
+        for n, p in self.video_id_adapter.named_parameters():
+            p.original_name = f"video_id_adapter.{n}"
 
-        # 4) 把 Adapter 参数加入训练列表
+        # 5) 把 Adapter 参数加入训练列表
         for p in self.video_id_adapter.parameters():
             p.requires_grad_(True)
 
@@ -573,11 +581,32 @@ class WanPipeline(BasePipeline):
         # Return the inner nn.Module
         return [self.text_encoder.model]
 
-    def save_adapter(self, save_dir, peft_state_dict):
-        self.peft_config.save_pretrained(save_dir)
-        # ComfyUI format.
-        peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
-        safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
+    def save_adapter(self, save_dir, state_dict):
+        
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1) LoRA – 保持旧逻辑
+        if getattr(self, "adapter_type", None) == "lora":
+            self.peft_config.save_pretrained(save_dir)
+            # ComfyUI format.
+            peft_state_dict = {'diffusion_model.'+k: v for k, v in state_dict.items()}
+            safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
+            return
+        
+        # 2) Video-ID Adapter – 仅需保存 adapter & id_cross_attn 权重
+        if getattr(self, "adapter_type", None) == "video_id":
+            # 直接把 state_dict 打包成 safetensors
+            safetensors.torch.save_file(
+                state_dict, save_dir / "video_id_adapter.safetensors",
+                metadata={"format": "pt"}
+            )
+            return
+
+        # 3) 其它类型暂不支持
+        raise NotImplementedError(
+            f"save_adapter not implemented for adapter_type={getattr(self, 'adapter_type', None)}"
+        )        
 
     def save_model(self, save_dir, diffusers_sd):
         raise NotImplementedError()
