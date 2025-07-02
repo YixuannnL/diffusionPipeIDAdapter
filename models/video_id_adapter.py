@@ -51,36 +51,40 @@ class VideoIDAdapter(nn.Module):
         num_heads: int = 16,
         mlp_ratio: int = 4,
         proj_in_channels: Optional[int] = None,  # 若 None, 用 LazyLinear
+        adapter_dim: int = 1024,     # 内部瓶颈宽度
         dropout: float = 0.0,
     ):
         super().__init__()
         self.num_id_tokens = num_id_tokens
         self.hidden_size = hidden_size
+        self.adapter_dim = adapter_dim
 
-        # 4/8/16 → hidden_size 线性投影（Lazy 自动推断通道）
+        # 4/16 → adapter_dim
         if proj_in_channels is None:
-            self.in_proj = nn.LazyLinear(hidden_size, bias=False)
+            self.in_proj = nn.LazyLinear(adapter_dim, bias=False)
         else:
-            self.in_proj = nn.Linear(proj_in_channels, hidden_size, bias=False)
+            self.in_proj = nn.Linear(proj_in_channels, adapter_dim, bias=False)
 
         # learnable [ID] tokens
         self.id_tokens = nn.Parameter(
-            torch.randn(1, num_id_tokens, hidden_size) / math.sqrt(hidden_size)
+            torch.randn(1, num_id_tokens, adapter_dim) / math.sqrt(adapter_dim)
         )
 
         # Position encoding（时空展平后一维绝对 PE）
-        self.pos_enc = PositionalEncoding(hidden_size)
+        self.pos_enc = PositionalEncoding(adapter_dim)
 
         # 标准 Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
+            d_model=adapter_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_size * mlp_ratio,
+            dim_feedforward=adapter_dim * mlp_ratio,
             dropout=dropout,
             batch_first=True,
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        self.out_proj = nn.Linear(adapter_dim, hidden_size, bias=True)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         """
@@ -107,5 +111,17 @@ class VideoIDAdapter(nn.Module):
 
         x = self.transformer(x)                     # same shape
 
-        # 取前 N 个
-        return x[:, :self.num_id_tokens, :]
+        out = x[:, :self.num_id_tokens, :]          # [B,N, adapter_dim]
+        # 映射回 Wan hidden_size=5120 供 cross-attn
+        return self.out_proj(out)
+
+    # output projection weights（trainable）
+    # out_proj_weight: torch.Tensor
+    # out_proj_bias:   torch.Tensor
+    def _init_output_proj(self, hidden_size, adapter_dim):
+        self.out_proj_weight = nn.Parameter(torch.empty(hidden_size, adapter_dim))
+        self.out_proj_bias   = nn.Parameter(torch.zeros(hidden_size))               
+        nn.init.kaiming_uniform_(self.out_proj_weight, a=math.sqrt(5))
+
+    def __post_init__(self):
+        self._init_output_proj(self.hidden_size, self.adapter_dim)

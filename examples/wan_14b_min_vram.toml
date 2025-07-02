@@ -20,7 +20,7 @@ eval_micro_batch_size_per_gpu = 1
 eval_gradient_accumulation_steps = 1
 
 # misc settings
-save_every_n_epochs = 5
+save_every_n_epochs = 1
 checkpoint_every_n_minutes = 120
 activation_checkpointing = 'unsloth'
 partition_method = 'parameters'
@@ -43,7 +43,8 @@ timestep_sample_method = 'logit_normal'
 #dtype = 'bfloat16'
 type           = "video_id"
 num_id_tokens  = 16
-layers         = [12, 15, 18, 21]        # 对应 ConsisID 高频层
+layers         = [12, 15, 18, 21] # 0: Initial 1:Adapter 所以打印出来的层数会+2
+adapter_dim = 2048
 num_layers     = 4
 num_heads      = 16
 mlp_ratio      = 4

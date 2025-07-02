@@ -118,6 +118,7 @@ def set_config_defaults(config):
             adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
             # 提供几个安全默认，便于 TOML 里省略
             adapter_config.setdefault('num_id_tokens', 16)
+            adapter_config.setdefault('adapter_dim', 1024)
             adapter_config.setdefault('num_layers', 4)
             adapter_config.setdefault('num_heads', 16)
             adapter_config.setdefault('mlp_ratio', 4)
@@ -450,6 +451,10 @@ if __name__ == '__main__':
             model.load_adapter_weights(init_from_existing)
     else:
         is_adapter = False
+        
+    # 打印注入了ID Tokens的层 -lyx
+    print(">>> use_id_tokens layers:",
+      [i for i,b in enumerate(model.transformer.blocks) if getattr(b,"use_id_tokens",False)])
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
@@ -640,14 +645,13 @@ if __name__ == '__main__':
         config=ds_config,
     )
     
+    # 一次性打印可训练参数表 -lyx
     if is_main_process():
         trainables = [(n, p.numel()) for n, p in pipeline_model.named_parameters() if p.requires_grad]
         total = sum(x[1] for x in trainables)
         print(f"\n=== Trainable params ({total/1e6:.2f} M) ===")
         for n, k in trainables:
             print(f"{k/1e6:7.2f} M  {n}")
-    import pdb
-    pdb.set_trace()
     
     model.model_engine = model_engine
     if model_engine.is_pipe_parallel:

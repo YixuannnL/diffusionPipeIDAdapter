@@ -527,6 +527,7 @@ class WanPipeline(BasePipeline):
             hidden_size       = hidden,
             num_id_tokens     = adapter_config.get('num_id_tokens', 16),
             num_layers        = adapter_config.get('num_layers', 4),
+            adapter_dim        = adapter_config.get('adapter_dim', 1024),
             num_heads         = adapter_config.get('num_heads', 16),
             mlp_ratio         = adapter_config.get('mlp_ratio', 4),
             dropout           = adapter_config.get('dropout', 0.0),
@@ -543,18 +544,18 @@ class WanPipeline(BasePipeline):
             blk = self.transformer.blocks[idx]
             if not getattr(blk, "use_id_tokens", False):
                 blk.use_id_tokens = True
-        # 拿同一个 CrossAttention 类直接实例化
-        cross_attn_cls = blk.cross_attn.__class__
-        blk.id_cross_attn = cross_attn_cls(
-            blk.dim,
-            blk.num_heads,
-            (-1, -1),
-            blk.qk_norm,
-            blk.eps,
-        ).to(                                       # 与原 cross-attn 对齐 dtype / device
-            blk.cross_attn.q.weight.device,
-            dtype=self.model_config["dtype"],      # 强制 bfloat16 / fp16
-        )
+                # 拿同一个 CrossAttention 类直接实例化
+                cross_attn_cls = blk.cross_attn.__class__
+                blk.id_cross_attn = cross_attn_cls(
+                    blk.dim,
+                    blk.num_heads,
+                    (-1, -1),
+                    blk.qk_norm,
+                    blk.eps,
+                ).to(                                       # 与原 cross-attn 对齐 dtype / device
+                    blk.cross_attn.q.weight.device,
+                    dtype=self.model_config["dtype"],      # 强制 bfloat16 / fp16
+                )
 
         # 4) 把 Adapter 参数加入训练列表
         for p in self.video_id_adapter.parameters():
@@ -635,7 +636,7 @@ class WanPipeline(BasePipeline):
                 return {'text_embeddings': text_embeddings, 'seq_lens': seq_lens}
         return fn
 
-    def prepare_inputs(self, inputs, timestep_quantile=None):
+    def prepare_inputs(self, inputs, timestep_quantile=None):      
         latents = inputs['latents'].float()
         # TODO: why does text_embeddings become float32 here? It's bfloat16 coming out of the text encoder.
         text_embeddings = inputs['text_embeddings']
@@ -683,27 +684,34 @@ class WanPipeline(BasePipeline):
         t = t * 1000
         
         # -------- Video-ID Adapter --------
+        # id_tokens, id_lens = None, None # 现在由 AdapterLayer 生成
+        # -------- Video-ID Adapter --------
         if self.video_id_adapter is not None:
-            with torch.autocast(device_type=latents.device.type,
-                                dtype=self.model_config['dtype']):
-                id_tokens = self.video_id_adapter(x_1)        # [B, N, D]
-            id_lens = torch.full(
-                (bs,), id_tokens.size(1), dtype=torch.long,
-                device=id_tokens.device
-            )
+            adap_dev = next(self.video_id_adapter.parameters()).device
+            latents_for_adp = latents.to(adap_dev, dtype=self.model_config["dtype"])
+            with torch.autocast(device_type=adap_dev.type,
+                                dtype=self.model_config["dtype"]):
+                id_tokens = self.video_id_adapter(latents_for_adp)   # [B,N,D]
+            id_lens = torch.full((bs,), id_tokens.size(1),
+                                dtype=torch.long, device=id_tokens.device)
         else:
             id_tokens, id_lens = None, None
 
         return (
             # (x_t, y, t, text_embeddings, seq_lens, clip_context),
-            (x_t, y, t, text_embeddings, seq_lens, clip_context,
-             id_tokens, id_lens),
+            (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens),
             (target, mask),
         )
 
     def to_layers(self):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
+        
+        # —— 在 InitialLayer 之后插入 AdapterLayer ——
+        if self.video_id_adapter is not None:
+            from models.adapter_layer import AdapterLayer
+            layers.append(AdapterLayer(self.video_id_adapter))
+        
         for i, block in enumerate(transformer.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(transformer))
