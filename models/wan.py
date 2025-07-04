@@ -581,6 +581,81 @@ class WanPipeline(BasePipeline):
         # Return the inner nn.Module
         return [self.text_encoder.model]
 
+    def load_video_id_adapter_weights(self, weights_file: str):
+        """
+        自动：
+        ① 若 video_id_adapter 尚未创建，则 **根据权重 shape** 推断超参并实例化
+        ② 为需要注入的 blocks 创建 id_cross_attn
+        ③ 加载权重
+        """
+        sd = load_file(weights_file, device='cpu')
+
+        # ---------- 1.  若 adapter 不存在 → 根据 state_dict 推断并创建 ----------
+        if getattr(self, "video_id_adapter", None) is None:
+            # 1) 基础形状信息
+            tok_key   = next(k for k in sd if k.startswith("video_id_adapter.id_tokens"))
+            _, N, adapter_dim = sd[tok_key].shape
+
+            # 2) 输入通道 from in_proj.weight
+            inproj_key = next(k for k in sd if k.startswith("video_id_adapter.in_proj.weight"))
+            in_channels = sd[inproj_key].shape[1]          # 16 in your ckpt
+
+            # 3) num_layers
+            layer_idxs = [int(m.group(1)) for k in sd
+                        if (m := re.match(r"video_id_adapter\.transformer\.layers\.(\d+)\.", k))]
+            num_layers = max(layer_idxs) + 1
+
+            # 4) num_heads  – choose divisor of adapter_dim
+            def pick_heads(dim):
+                for h in (16, 12, 8, 4, 2, 1):
+                    if dim % h == 0:
+                        return h
+                return 4
+            num_heads = pick_heads(adapter_dim)
+
+            hidden = self.transformer.dim  # 5120
+            self.video_id_adapter = VideoIDAdapter(
+                hidden_size        = hidden,
+                num_id_tokens      = N,
+                num_layers         = num_layers,
+                num_heads          = num_heads,
+                adapter_dim        = adapter_dim,
+                proj_in_channels   = in_channels,   # ← auto-detected (16)
+            ).to(dtype=self.model_config["dtype"], device='cuda')
+
+            print(f"[adapter] instantiated: "
+                f"N={N}, adapter_dim={adapter_dim}, in_ch={in_channels}, "
+                f"layers={num_layers}, heads={num_heads}")
+
+        # ---------- 2.  为每个 blocks.<idx>.id_cross_attn.* 创建模块 ----------
+        inject_blocks = set(
+            int(m.group(1)) for k in sd
+            if (m := re.match(r"blocks\.(\d+)\.id_cross_attn\.", k))
+        )
+        for idx in inject_blocks:
+            blk = self.transformer.blocks[idx]
+            if not hasattr(blk, "id_cross_attn"):
+                cross_cls = blk.cross_attn.__class__
+                blk.id_cross_attn = cross_cls(
+                    blk.dim, blk.num_heads, (-1,-1),
+                    blk.qk_norm, blk.eps
+                ).to(dtype=self.model_config["dtype"], device='cuda')
+
+        # ---------- 3.  load weights ----------
+        # 3.1 adapter
+        adpt_kv = {k.replace("video_id_adapter.", ""): v for k,v in sd.items()
+                   if k.startswith("video_id_adapter.")}
+        missing = self.video_id_adapter.load_state_dict(adpt_kv, strict=False)[0]
+        print("adapter missing:", len(missing))
+
+        # 3.2 id_cross_attn
+        xattn_kv = {k:v for k,v in sd.items() if k.startswith("blocks.")}
+        miss2, unexp = self.transformer.load_state_dict(xattn_kv, strict=False)
+        print(f"id_cross missing={len(miss2)}, unexpected={len(unexp)}")
+
+        # ---------- 4.  done ----------
+        self.adapter_type = "video_id"
+        
     def save_adapter(self, save_dir, state_dict):
         
         save_dir = Path(save_dir)
@@ -773,6 +848,11 @@ class WanPipeline(BasePipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def eval(self):
+        self.transformer.eval()
+        if hasattr(self, "video_id_adapter") and self.video_id_adapter is not None:
+            self.video_id_adapter.eval()
+        return self
 
 class InitialLayer(nn.Module):
     def __init__(self, model):

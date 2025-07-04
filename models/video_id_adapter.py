@@ -88,31 +88,27 @@ class VideoIDAdapter(nn.Module):
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         """
-        latents: [B, 4, F, H, W] – Wan-VAE 输出 (未加噪)
+        latents: [B, C, F, H, W] – Wan-VAE 输出 (未加噪)
         return id_tokens: [B, N, D]
         """
-        B, C, F, H, W = latents.shape               # 4 / 17 / 160 / 90
-        # 时空展平 -> L = F*H*W
-        # x = latents.permute(0, 2, 3, 4, 1).reshape(B, F * H * W, C)
-        # ① 先对空间 (H,W) 做平均池化，得到帧级特征
-        # x = latents.mean(dim=[3, 4]).permute(0, 2, 1)                # [B, F, C] 17 token
+        B, C, F, H, W = latents.shape               # 16 / 17 / 160 / 90
         g_h, g_w = 4, 4
         h_idx = torch.linspace(0, latents.size(3)-1, g_h).long()
         w_idx = torch.linspace(0, latents.size(4)-1, g_w).long()
         lat_sel = latents[:, :, :, h_idx][:, :, :, :, w_idx]   # [B,C,F,4,4]
-        x = lat_sel.permute(0, 2, 3, 4, 1).reshape(B, F*g_h*g_w, C)  # [B, L, C]    
+        x = lat_sel.permute(0, 2, 3, 4, 1).reshape(B, F*g_h*g_w, C)  # 把 [B,C,F,4,4] → [B, F, 4, 4, C] → [B, L, C]，形成每个采样点一个 token 的时空序列  
         L = F  # 序列长度
-        x = self.in_proj(x)                         # [B, L, D]
-        x = self.pos_enc(x)
+        x = self.in_proj(x)                         # [B, L, D] in_proj: C → adapter_dim
+        x = self.pos_enc(x)                         # 为序列中每个位置添加可微分的绝对正弦余弦位置信息，使 Transformer 能区分 token 在时间/空间序列上的先后
 
         # prepend learnable ID tokens
         id_tok = self.id_tokens.expand(B, -1, -1)   # [B, N, D]
-        x = torch.cat([id_tok, x], dim=1)           # [B, N+L, D]
+        x = torch.cat([id_tok, x], dim=1)           # [B, N+L, D] 把它们“ prepend” 到时空 token 序列前面，让 Transformer 可以用后续的自注意力把时空信息汇聚到这些 ID token 上
 
         x = self.transformer(x)                     # same shape
 
-        out = x[:, :self.num_id_tokens, :]          # [B,N, adapter_dim]
-        # 映射回 Wan hidden_size=5120 供 cross-attn
+        out = x[:, :self.num_id_tokens, :]          # [B,N, adapter_dim] 取出经 Transformer 更新后的前 N 个 “身份” token
+        # 映射回 Wan hidden_size=5120 供 cross-attn 用一个全连接把 adapter_dim 投回与 Wan cross-attn 相同的维度（5120），以便后续注入到主模型的 cross-attn 中
         return self.out_proj(out)
 
     # output projection weights（trainable）
