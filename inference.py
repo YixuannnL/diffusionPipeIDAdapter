@@ -13,11 +13,11 @@ from models.wan import WanPipeline, vae_encode
 # --------------------- CLI ------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', default="/data/bohong/diffusion-pipe/examples/wan_14b_min_vram.toml", help='Same TOML used for training')
-parser.add_argument('--adapter', default="/data/bohong/diffusion-pipe/data/output/20250703_09-25-41/epoch1/video_id_adapter.safetensors", help='video_id_adapter.safetensors')
+parser.add_argument('--adapter', default="/data/bohong/diffusion-pipe/data/output/20250703_09-25-41/epoch6/video_id_adapter.safetensors", help='video_id_adapter.safetensors')
 parser.add_argument('--ref_video', default="/data/bohong/diffusion-pipe/data/input/VIDEOS/video1.mp4", help='User video path')
 parser.add_argument('--prompt', default="The video captures a woman walking along a city street, filmed in black and white on a classic 35mm camera. Her expression is thoughtful, her brow slightly furrowed as if she's lost in contemplation. The film grain adds a textured, timeless quality to the image, evoking a sense of nostalgia. Around her, the cityscape is filled with vintage buildings, cobblestone sidewalks, and softly blurred figures passing by, their outlines faint and indistinct. Streetlights cast a gentle glow, while shadows play across the woman's path, adding depth to the scene. The lighting highlights the woman's subtle smile, hinting at a fleeting moment of curiosity. The overall cinematic atmosphere, complete with classic film still aesthetics and dramatic contrasts, gives the scene an evocative and introspective feel.",help='Text prompt')
 parser.add_argument('--out_dir', default="/data/bohong/diffusion-pipe/data/inference_output", help='Output mp4 file')
-parser.add_argument('--num_steps', type=int, default=1, help='DDIM / Euler steps')
+parser.add_argument('--num_steps', type=int, default=50, help='DDIM / Euler steps')
 parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--cfg_scale', type=float, default=3.0,
                     help='classifier-free guidance scale (>=1.0)') # --cfg_scale=1.0 ⇒ 不使用 CFG；
@@ -143,15 +143,17 @@ print('[*] decoding & saving …')
 vae = pipe.vae
 vae.model.to('cuda', dtype=torch.float32)
 with torch.no_grad():
-    latents = x / vae.config.scaling_factor
-    if getattr(vae.config, 'shift_factor', None) is not None:
-        latents = latents + vae.config.shift_factor
-    video = vae.decode(latents).sample                      # [1,C,F,H,W]  [-1,1]
-video = ((video.squeeze(0).permute(2,3,4,1) + 1) / 2).clamp(0,1)  # [F,H,W,C] 0-1
+    video = vae.model.decode(x, vae.scale).float().clamp_(-1, 1)   # [1,3,F,H,W]
+# [1,C,T,H,W] → [T,H,W,C] 并归一化到 [0,1]
+video = video.squeeze(0)                  # [C,T,H,W]
+video = torch.permute(video, (1, 2, 3, 0))# [T,H,W,C]
+video = ((video + 1) / 2).clamp(0, 1)     # [0,1]
 
 out_dir = Path(args.out_dir);  out_dir.mkdir(exist_ok=True, parents=True)
 mp4_path = out_dir / 'result.mp4'
 png_path = out_dir / 'first_frame.png'
-iio.imwrite(out_dir/'result.mp4', (video*255).byte(), fps=pipe.framerate)
-iio.imwrite(out_dir/'first_frame.png', (video[0]*255).byte())
+video_uint8 = (video * 255).byte().cpu().numpy()       # shape [T, H, W, C]
+first_frame_uint8 = video_uint8[0]
+iio.imwrite(mp4_path, video_uint8, fps=pipe.framerate)
+iio.imwrite(png_path,    first_frame_uint8)
 print(f'finished. saved to {mp4_path}')
