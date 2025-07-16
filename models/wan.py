@@ -8,10 +8,13 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import torch
 from torch import nn
+import torch.utils.checkpoint as cp
 import torch.nn.functional as F
+import torch.distributed as dist
 import safetensors, os
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
+import insightface, functools
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
@@ -318,8 +321,9 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
-        id_tokens=None,        # ← 新增
-        id_lens=None,          # ← 新增
+        id_tokens=None,        
+        id_lens=None, 
+        face_emb=None,
     ):
         r"""
         Args:
@@ -404,7 +408,8 @@ class WanPipeline(BasePipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
-
+        self.dtype = dtype
+        
         # SkyReels V2 uses 24 FPS. There seems to be no better way to autodetect this.
         if 'skyreels' in Path(ckpt_dir).name.lower():
             skyreels = True
@@ -477,6 +482,17 @@ class WanPipeline(BasePipeline):
                 checkpoint_path=os.path.join(ckpt_dir, wan_config.clip_checkpoint),
                 tokenizer_path=os.path.join(ckpt_dir, wan_config.clip_tokenizer)
             )
+            
+        if self.config.get("use_id_loss", False):
+            from models.face_encoder import FaceEncoder
+            self.face_encoder = FaceEncoder(device='cuda')
+            self.id_loss_weight = self.config.get("id_loss_weight", 0.1)
+        else:
+            self.face_encoder = None
+            
+        self._vae_on_cuda = False
+        self._last_id_loss = None
+
 
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
@@ -625,9 +641,22 @@ class WanPipeline(BasePipeline):
         def fn(tensor):
             vae = vae_and_clip.vae
             p = next(vae.parameters())
-            tensor = tensor.to(p.device, p.dtype)
+            tensor = tensor.to(p.device, p.dtype)           
             latents = vae_encode(tensor, self.vae)
             ret = {'latents': latents}
+
+            # ====== Face-ID branch ======
+            if self.face_encoder is not None:
+                # 取首帧，范围保持 [-1,1]
+                first = tensor[:, :, 0, ...]                 # (B,C,H,W)
+                # InsightFace 推荐 112×112；这里 224×224 精度更好
+                first_resized = torch.nn.functional.interpolate(
+                    first, size=(224,224), mode='bilinear', align_corners=False
+                )
+                with torch.no_grad():
+                    emb = self.face_encoder(first_resized)   # (B,512), 已经 L2-norm
+                ret['face_emb'] = emb.to('cpu')              # 存 CPU，方便写 Arrow
+            # ==================================
             clip = vae_and_clip.clip
             if clip is not None:
                 assert tensor.ndim == 5, f'i2v/flf2v must train on videos, got tensor with shape {tensor.shape}'
@@ -673,6 +702,7 @@ class WanPipeline(BasePipeline):
         mask = inputs['mask']
         y = inputs['y'] if self.i2v or self.flf2v else None
         clip_context = inputs['clip_context'] if self.i2v or self.flf2v else None
+        face_emb = inputs.get('face_emb', None)
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -725,11 +755,10 @@ class WanPipeline(BasePipeline):
                                 dtype=torch.long, device=id_tokens.device)
         else:
             id_tokens, id_lens = None, None
-
         return (
             # (x_t, y, t, text_embeddings, seq_lens, clip_context),
-            (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens),
-            (target, mask),
+            (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens, face_emb),
+            (target, mask, face_emb),
         )
 
     def to_layers(self):
@@ -772,6 +801,100 @@ class WanPipeline(BasePipeline):
             self.offloader.disable_block_swap()
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
+        
+    def get_loss_fn(self):
+        mse = torch.nn.MSELoss(reduction="none")          # 与原实现一致
+        
+        def decode_ckpt(vae, lat, scale):
+            """
+            内部函数必须只收 Tensor；把列表拆开。
+            """
+            def _run(z):                  # z 形状 (C,H,W)
+                out = vae.model.decode(z.unsqueeze(0), scale)[0]
+                return out
+
+            return cp.checkpoint(_run, lat, use_reentrant=False)      # 激活在 backward 时重算
+
+        # 通过闭包捕获 self
+        def loss_fn(model_output, label):
+            """
+            model_output : (B,C,F,H,W)   — ε̂ 或 v̂
+            label        : (target, mask [, ref_face])
+            return       : scalar loss
+            """
+            # ----------- 1. 解析 label -----------
+            if len(label) == 3:
+                target, mask, ref_face = label
+            else:                       # 兼容旧缓存
+                target, mask = label
+                ref_face = None
+
+            # ----------- 2. 扩散 MSE/V-pred 损失 -----------
+            # 保证 dtype 一致，避免 Float/BF16 混用导致的反向传播错误
+            target = target.to(model_output.dtype)
+            if mask is not None and mask.numel():
+                mask = mask.to(model_output.dtype)
+            diff_loss = mse(model_output, target)
+            if mask is not None and mask.numel():
+                diff_loss = diff_loss * mask
+            diff_loss = diff_loss.mean()
+
+            total_loss = diff_loss                         # 初始化总损失
+
+            # ----------- 3. Face-ID 损失 -----------
+            if (
+                (self.face_encoder is not None) and        # 已启用人脸 Encoder
+                (ref_face is not None) and                 # 数据里带 ref 向量
+                ref_face.abs().sum() > 0                   # 不是全 0（= 未检出脸）
+            ):
+                # (a) 取预测首帧 latent → decode → [-1,1]
+                i = torch.randint(0, model_output.size(2), (1,)).item()
+                first_lat = model_output[:, :, i:i+1, :, :].squeeze(0)                 # (B,C,1,H,W) -> (C,1,H,W)              
+                first_lat_device = first_lat.to(dtype=self.vae.dtype, memory_format=torch.contiguous_format)
+                target_device = first_lat_device.device
+                if not self._vae_on_cuda:
+                    # (1) 移动 VAE 主体
+                    self.vae.model.to(target_device)
+                    # (2) 移动统计量并重新缓存 scale
+                    self.vae.mean = self.vae.mean.to(target_device)
+                    self.vae.std  = self.vae.std.to(target_device)
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = target_device
+                    self._vae_on_cuda = True
+                    
+                scale_down = 0.5
+                first_lat_device = first_lat_device
+                
+                lat_small  = F.interpolate(first_lat_device, scale_factor=scale_down, mode='bilinear', align_corners=False)
+                # WanVAE.decode expects a list and returns a list[Tensor].
+                
+                with torch.autocast('cuda', dtype=self.vae.dtype):
+                    recon_rgb = decode_ckpt(self.vae, lat_small, self.vae.scale)       # List[(3,H,W)]，[-1,1]
+                    recon_rgb = torch.clamp(recon_rgb, -1, 1)
+                
+                recon_rgb = F.interpolate(recon_rgb, 224, mode='bilinear', align_corners=False)
+                def _face_forward(img):
+                    return self.face_encoder(img)
+                    
+                recon_rgb = (recon_rgb + 1) / 2                        # → [0,1]
+                recon_bgr = recon_rgb[[2, 1, 0], :, :, :]              # InsightFace 用 BGR
+                recon_bgr = recon_bgr.squeeze(1).unsqueeze(0)
+                emb_pred = torch.utils.checkpoint.checkpoint(_face_forward, recon_bgr.half(), use_reentrant=False).float()
+
+                # (c) cosine 相似度 → ID-Loss
+                ref_face = ref_face.to(emb_pred.device, dtype=emb_pred.dtype)
+                cos_sim  = (emb_pred * ref_face).sum(dim=1)                # (B,)
+                id_loss  = (1 - cos_sim).mean().to(model_output.dtype)
+                total_loss = total_loss + self.id_loss_weight * id_loss
+
+                id_loss_val = id_loss.detach()
+                if 'id_loss_val' in locals():
+                    self._last_id_loss = id_loss_val.item()  # 只存本地，先不通信
+            # ----------- 4. 返回 -----------
+            return total_loss
+
+        return loss_fn
+
 
 
 class InitialLayer(nn.Module):
@@ -796,8 +919,8 @@ class InitialLayer(nn.Module):
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
                 
-        if len(inputs) == 8:
-            x, y, t, context, text_seq_lens, clip_fea, id_tokens, id_lens = inputs
+        if len(inputs) == 9:
+            x, y, t, context, text_seq_lens, clip_fea, id_tokens, id_lens, face_emb = inputs
         else:  # 旧路径 (无 adapter)
             x, y, t, context, text_seq_lens, clip_fea = inputs
             id_tokens, id_lens = None, None
@@ -856,7 +979,7 @@ class InitialLayer(nn.Module):
         seq_lens = seq_lens.to(x.device)
         grid_sizes = grid_sizes.to(x.device)
 
-        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context, id_tokens, id_lens)
+        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context, id_tokens, id_lens, face_emb)
 
 
 class TransformerLayer(nn.Module):
@@ -868,7 +991,7 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, e, e0, seq_lens, grid_sizes, freqs, context, id_tokens, id_lens = inputs
+        x, e, e0, seq_lens, grid_sizes, freqs, context, id_tokens, id_lens, face_emb = inputs
 
         self.offloader.wait_for_block(self.block_idx)
         # x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
@@ -880,7 +1003,7 @@ class TransformerLayer(nn.Module):
 
         # return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
         return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs,
-                               context, id_tokens, id_lens)
+                               context, id_tokens, id_lens, face_emb)
 
 
 class FinalLayer(nn.Module):

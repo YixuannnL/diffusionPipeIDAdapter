@@ -8,7 +8,7 @@ dataset = 'examples/dataset.toml'
 # training settings
 epochs = 1000
 micro_batch_size_per_gpu = 1
-pipeline_stages = 1
+pipeline_stages = 2
 gradient_accumulation_steps = 1
 gradient_clipping = 1
 warmup_steps = 10
@@ -30,12 +30,19 @@ steps_per_print = 1
 video_clip_mode = 'single_beginning'
 # blocks_to_swap = 32
 
+# --- Face-ID Loss ---
+use_id_loss     = true     # <- 额外字段
+id_loss_weight  = 0.1      # λ_id
+
+keep_vae_gpu = true
+
 [model]
 type = 'wan'
 ckpt_path = '/data/bohong/model/Wan2.1-T2V-14B'
 dtype = 'bfloat16'
 transformer_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
+keep_vae_gpu = true
 
 [adapter]
 #type = 'lora'
