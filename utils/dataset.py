@@ -6,6 +6,7 @@ import math
 import os
 import hashlib
 import json
+import cv2
 
 import numpy as np
 import torch
@@ -673,6 +674,8 @@ class Dataset:
                 ret[key] = torch.stack([example[key] for example in examples])
             else:
                 ret[key] = [example[key] for example in examples]
+        if 'face_emb' in examples[0]:
+            ret['face_emb'] = torch.stack([ex['face_emb'] for ex in examples])
         # Only some items in the batch might have valid mask.
         masks = [example['mask'] for example in examples]
         # See if we have any valid masks. If we do, they should all have the same shape.
@@ -973,12 +976,19 @@ class PipelineDataLoader:
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
-            target, mask = label
+            if len(label) == 3:
+                target, mask, face_emb = label
+            else:
+                target, mask = label
+                face_emb = None
             # The target depends on the noise, so we must broadcast it from the first stage to the last.
             # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
             # would line up on the first and last stage so that this doesn't deadlock.
             target = self._broadcast_target(target)
-            label = (target, mask)
+            if face_emb is not None:
+                label = (target, mask, face_emb)
+            else:
+                label = (target, mask)
             self.num_batches_pulled += 1
             for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
                 yield micro_batch

@@ -1,31 +1,39 @@
-import torch, torchvision
-import cv2, numpy as np, insightface
-from torch import nn
+# models/face_encoder.py  （整文件替换，保持与旧接口一致）
+import torch, torch.nn as nn, torch.nn.functional as F
+from facenet_pytorch import InceptionResnetV1
 
 class FaceEncoder(nn.Module):
     """
-    提供 .get(image_tensor[B,3,H,W]) -> emb[B,512]
-    image_tensor 范围 [-1,1] (Wan 默认)
+    img : (B,3,H,W)，RGB，数值范围 [-1, 1]
+    out : (B,512)，L2-normed，梯度可回传到 img
     """
-    def __init__(self, det_thresh=0.6, device='cuda'):
+
+    def __init__(self, device: str = "cpu"):
         super().__init__()
-        self.device = device
-        self.det_thresh = det_thresh
+        self._current_device = torch.device(device)
 
-        model = insightface.app.FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
-        model.prepare(ctx_id=0, det_size=(640, 640))
-        self.detector = model  # 带检测、对齐、embedding
+        # Facenet-pytorch 会自动下载 VGGFace2 预训练权重
+        self.backbone = (
+            InceptionResnetV1(pretrained='vggface2')
+            .to(self._current_device)
+            .eval()
+        ).half()
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)      # 冻结，但保持可微
+            
+    def _ensure_device(self, target: torch.device):
+        if target != self._current_device:
+            self.backbone.to(target, non_blocking=True)
+            self._current_device = target
 
-    @torch.no_grad()
-    def forward(self, img_t: torch.Tensor):
-        bs = img_t.shape[0]
-        out = torch.zeros(bs, 512, device=self.device)
-        for i in range(bs):
-            img = ((img_t[i].permute(1,2,0).cpu().numpy()+1)/2*255).astype(np.uint8)
-            faces = self.detector.get(img)
-            if len(faces)==0:
-                continue
-            face = max(faces, key=lambda f: f.bbox[2]-f.bbox[0])
-            out[i] = torch.from_numpy(face.embedding).to(self.device)
-        out = torch.nn.functional.normalize(out, dim=-1)
-        return out  # (B,512)
+    @torch.autocast('cuda')
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        self._ensure_device(img.device)
+        # [-1,1] → [0,1]
+        x = (img + 1) * 0.5
+        # Facenet 期望 160×160
+        x = F.interpolate(x, size=(160, 160), mode='bilinear', align_corners=False)
+        # Normalize：mean=0.5, std=0.5  → [-1,1]
+        x = (x - 0.5) / 0.5
+        emb = self.backbone(x)           # (B,512)
+        return F.normalize(emb, p=2, dim=-1)

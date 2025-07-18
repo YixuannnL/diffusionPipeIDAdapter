@@ -30,12 +30,19 @@ steps_per_print = 1
 video_clip_mode = 'single_beginning'
 # blocks_to_swap = 32
 
+# --- Face-ID Loss ---
+use_id_loss     = true     # <- 额外字段
+id_loss_weight  = 0.1      # λ_id
+
+keep_vae_gpu = true
+
 [model]
 type = 'wan'
 ckpt_path = '/data/bohong/model/Wan2.1-T2V-14B'
 dtype = 'bfloat16'
 transformer_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
+keep_vae_gpu = true
 
 [adapter]
 #type = 'lora'
@@ -44,7 +51,7 @@ timestep_sample_method = 'logit_normal'
 type           = "video_id"
 num_id_tokens  = 16
 layers         = [12, 15, 18, 21] # 0: Initial 1:Adapter 所以打印出来的层数会+2
-adapter_dim = 2048
+adapter_dim    = 2048
 num_layers     = 4
 num_heads      = 16
 mlp_ratio      = 4

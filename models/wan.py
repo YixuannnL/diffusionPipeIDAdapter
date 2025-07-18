@@ -8,10 +8,13 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import torch
 from torch import nn
+import torch.utils.checkpoint as cp
 import torch.nn.functional as F
+import torch.distributed as dist
 import safetensors, os
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
+import insightface, functools
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
@@ -31,7 +34,7 @@ from safetensors.torch import load_file
 from .video_id_adapter import VideoIDAdapter
 
 
-KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
+KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation', 'alpha_id']
 
 
 class WanModelFromSafetensors(WanModel):
@@ -59,7 +62,10 @@ class WanModelFromSafetensors(WanModel):
 
         for name, param in model.named_parameters():
             dtype_to_use = torch_dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
-            set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+            if name in state_dict:
+                set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+            else:
+                set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=torch.zeros(param.shape, dtype=dtype_to_use))
 
         return model
 
@@ -308,6 +314,9 @@ class WanAttentionBlock(nn.Module):
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        
+        # === NEW: residual‑scaling gates (ReZero style) ===
+        self.alpha_id  = nn.Parameter(torch.zeros(dim))   # 对 id‑cross‑attn
 
     def forward(
         self,
@@ -318,8 +327,9 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
-        id_tokens=None,        # ← 新增
-        id_lens=None,          # ← 新增
+        id_tokens=None,        
+        id_lens=None, 
+        face_emb=None,
     ):
         r"""
         Args:
@@ -341,6 +351,11 @@ class WanAttentionBlock(nn.Module):
         # def cross_attn_ffn(x, context, context_lens, e):
             # x = x + self.cross_attn(self.norm3(x), context, context_lens)
         def cross_attn_ffn(x, context, context_lens, id_tokens, id_lens, e):
+            
+            # 选一个“工作 dtype”：如果当前是 fp8，就升到 bf16，否则保持不变
+            work_dtype = torch.bfloat16 if x.dtype in (
+                torch.float8_e4m3fn, torch.float8_e5m2) else x.dtype
+            
             # text cross-attn
             y_txt = self.cross_attn(self.norm3(x), context, context_lens)
             # id-token cross-attn
@@ -348,7 +363,18 @@ class WanAttentionBlock(nn.Module):
                 y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens)
             else:
                 y_id = 0
-            x = x + y_txt + y_id
+                
+            y_txt = y_txt.to(work_dtype)
+            y_id  = y_id.to(work_dtype) if isinstance(y_id, torch.Tensor) else y_id
+            alpha_id  = self.alpha_id.to(work_dtype)
+            x_work = x.to(work_dtype)
+                
+            # x = x + y_txt + y_id * self.alpha_id
+            x = x_work + y_txt + alpha_id * y_id
+            # 如果原来是 fp8，就降回去；否则保持
+            if work_dtype != x_work.dtype:
+                x = x.to(x_work.dtype)
+            
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             x = x + y * e[5]
             return x
@@ -404,7 +430,8 @@ class WanPipeline(BasePipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
-
+        self.dtype = dtype
+        
         # SkyReels V2 uses 24 FPS. There seems to be no better way to autodetect this.
         if 'skyreels' in Path(ckpt_dir).name.lower():
             skyreels = True
@@ -477,6 +504,20 @@ class WanPipeline(BasePipeline):
                 checkpoint_path=os.path.join(ckpt_dir, wan_config.clip_checkpoint),
                 tokenizer_path=os.path.join(ckpt_dir, wan_config.clip_tokenizer)
             )
+            
+        if self.config.get("use_id_loss", False):
+            from models.face_encoder import FaceEncoder
+            self.face_encoder = FaceEncoder(device='cpu')
+            
+            self.id_loss_base          = self.config.get("id_loss_weight", 0.1)
+            self.id_loss_warmup_steps  = self.config.get("id_loss_warmup_steps", 5_000)
+            self._global_step          = 0
+        else:
+            self.face_encoder = None
+            
+        self._vae_on_cuda = False
+        self._last_id_loss = None
+
 
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
@@ -501,7 +542,10 @@ class WanPipeline(BasePipeline):
                         state_dict[key] = f.get_tensor(key)
             for name, param in self.transformer.named_parameters():
                 dtype_to_use = dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
-                set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+                if name in state_dict:
+                    set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+                else:
+                    set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype_to_use, value=torch.zeros(param.shape, dtype=dtype_to_use))
 
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
@@ -560,6 +604,11 @@ class WanPipeline(BasePipeline):
             # --- 给新建 cross-attn 的每个参数打 original_name ---
             for n, p in blk.id_cross_attn.named_parameters():
                 p.original_name = f"blocks.{idx}.id_cross_attn.{n}"
+        # 让 α gate 继续参与训练
+        for idx in inject_layers:
+            blk = self.transformer.blocks[idx]
+            if hasattr(blk, "alpha_id"):
+                blk.alpha_id.requires_grad_(True)
                 
         # 4) 给 Adapter 自身权重打 original_name
         for n, p in self.video_id_adapter.named_parameters():
@@ -676,6 +725,12 @@ class WanPipeline(BasePipeline):
                 state_dict, save_dir / "video_id_adapter.safetensors",
                 metadata={"format": "pt"}
             )
+            
+            # safetensors.torch.save_file(
+            #     self.trainable_state_dict(),
+            #     save_dir / "video_id_deltas.safetensors",
+            #     metadata={"format": "pt"}
+            # )
             return
 
         # 3) 其它类型暂不支持
@@ -700,9 +755,22 @@ class WanPipeline(BasePipeline):
         def fn(tensor):
             vae = vae_and_clip.vae
             p = next(vae.parameters())
-            tensor = tensor.to(p.device, p.dtype)
+            tensor = tensor.to(p.device, p.dtype)           
             latents = vae_encode(tensor, self.vae)
             ret = {'latents': latents}
+
+            # ====== Face-ID branch ======
+            if self.face_encoder is not None:
+                # 取首帧，范围保持 [-1,1]
+                first = tensor[:, :, 0, ...]                 # (B,C,H,W)
+                # InsightFace 推荐 112×112；这里 224×224 精度更好
+                first_resized = torch.nn.functional.interpolate(
+                    first, size=(224,224), mode='bilinear', align_corners=False
+                )
+                with torch.no_grad():
+                    emb = self.face_encoder(first_resized)   # (B,512), 已经 L2-norm
+                ret['face_emb'] = emb.to('cpu')              # 存 CPU，方便写 Arrow
+            # ==================================
             clip = vae_and_clip.clip
             if clip is not None:
                 assert tensor.ndim == 5, f'i2v/flf2v must train on videos, got tensor with shape {tensor.shape}'
@@ -748,6 +816,7 @@ class WanPipeline(BasePipeline):
         mask = inputs['mask']
         y = inputs['y'] if self.i2v or self.flf2v else None
         clip_context = inputs['clip_context'] if self.i2v or self.flf2v else None
+        face_emb = inputs.get('face_emb', None)
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -800,11 +869,10 @@ class WanPipeline(BasePipeline):
                                 dtype=torch.long, device=id_tokens.device)
         else:
             id_tokens, id_lens = None, None
-
         return (
             # (x_t, y, t, text_embeddings, seq_lens, clip_context),
-            (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens),
-            (target, mask),
+            (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens, face_emb),
+            (target, mask, face_emb),
         )
 
     def to_layers(self):
@@ -847,6 +915,118 @@ class WanPipeline(BasePipeline):
             self.offloader.disable_block_swap()
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
+        
+    def get_loss_fn(self):
+        mse = torch.nn.MSELoss(reduction="none")          # 与原实现一致
+        
+        def decode_ckpt(vae, lat, scale):
+            """
+            内部函数必须只收 Tensor；把列表拆开。
+            """
+            def _run(z):                  # z 形状 (C,H,W)
+                out = vae.model.decode(z.unsqueeze(0), scale)[0]
+                return out
+
+            return cp.checkpoint(_run, lat, use_reentrant=False)      # 激活在 backward 时重算
+
+        # 通过闭包捕获 self
+        def loss_fn(model_output, label):
+            """
+            model_output : (B,C,F,H,W)   — ε̂ 或 v̂
+            label        : (target, mask [, ref_face])
+            return       : scalar loss
+            """
+            # ----------- 1. 解析 label -----------
+            if len(label) == 3:
+                target, mask, ref_face = label
+            else:                       # 兼容旧缓存
+                target, mask = label
+                ref_face = None
+
+            # ----------- 2. 扩散 MSE/V-pred 损失 -----------
+            # 保证 dtype 一致，避免 Float/BF16 混用导致的反向传播错误
+            target = target.to(model_output.dtype)
+            if mask is not None and mask.numel():
+                mask = mask.to(model_output.dtype)
+            diff_loss = mse(model_output, target)
+            if mask is not None and mask.numel():
+                diff_loss = diff_loss * mask
+            diff_loss = diff_loss.mean()
+
+            total_loss = diff_loss                         # 初始化总损失
+
+            # ----------- 3. Face-ID 损失 -----------
+            if (
+                (self.face_encoder is not None) and        # 已启用人脸 Encoder
+                (ref_face is not None) and                 # 数据里带 ref 向量
+                ref_face.abs().sum() > 0                   # 不是全 0（= 未检出脸）
+            ):
+                # (a) 取预测首帧 latent → decode → [-1,1]
+                i = torch.randint(0, model_output.size(2), (1,)).item()
+                first_lat = model_output[:, :, i:i+1, :, :].squeeze(0)                 # (B,C,1,H,W) -> (C,1,H,W)              
+                first_lat_device = first_lat.to(dtype=self.vae.dtype, memory_format=torch.contiguous_format)
+                target_device = first_lat_device.device
+                if not self._vae_on_cuda:
+                    # (1) 移动 VAE 主体
+                    self.vae.model.to(target_device)
+                    # (2) 移动统计量并重新缓存 scale
+                    self.vae.mean = self.vae.mean.to(target_device)
+                    self.vae.std  = self.vae.std.to(target_device)
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = target_device
+                    self._vae_on_cuda = True
+                    
+                def _decode_and_embed(z):            # z.shape = (C,H,W)
+                    rgb = self.vae.model.decode(z.unsqueeze(0), self.vae.scale)[0]   # [-1,1]
+                    rgb = rgb.clamp_(-1, 1)
+                    rgb = rgb.squeeze(1).unsqueeze(0)
+                    emb = self.face_encoder(rgb)     # (1,512)
+                    return emb
+                
+                # lat_small  = F.interpolate(first_lat_device, scale_factor=0.5, mode='bilinear', align_corners=False).half()
+                emb_pred = torch.utils.checkpoint.checkpoint(
+                            _decode_and_embed, first_lat_device, use_reentrant=False
+                        ).float()
+
+                # (c) cosine 相似度 → ID-Loss
+                ref_face = ref_face.to(emb_pred.device, dtype=emb_pred.dtype)
+                cos_sim  = (emb_pred * ref_face).sum(dim=1)                # (B,)
+                id_loss  = (1 - cos_sim).mean().to(model_output.dtype)
+                
+                # 渐进式权重：前 warmup_steps 线性爬坡
+                scale      = min(1.0,  self._global_step / max(1, self.id_loss_warmup_steps))
+                total_loss = total_loss + self.id_loss_base * scale * id_loss
+
+                id_loss_val = id_loss.detach()
+                if 'id_loss_val' in locals():
+                    self._last_id_loss = (id_loss.detach(), scale)  # 只存本地，先不通信
+            # ----------- 4. 返回 -----------
+            return total_loss
+
+        return loss_fn
+
+    def trainable_state_dict(self):
+        """
+        收集 **当前 rank** 持有且 requires_grad=True 的所有参数，
+        不依赖 self.named_parameters()，避免 __getattr__ 递归。
+        返回 {name: tensor.cpu()} 字典，可供 all‑gather 后保存。
+        """
+        state = {}
+        seen = set()                             # 防止重复
+
+        def _collect(prefix: str, mod: torch.nn.Module):
+            for n, p in mod.named_parameters(recurse=True):
+                if p.requires_grad and id(p) not in seen:
+                    key = getattr(p, "original_name", f"{prefix}.{n}" if prefix else n)
+                    state[key] = p.detach().cpu()
+                    seen.add(id(p))
+
+        # 2. Wan 主干里真正是 nn.Module 的字段，例如 transformer / vae 等
+        for attr_name, attr_val in self.__dict__.items():
+            if isinstance(attr_val, torch.nn.Module):
+                _collect(attr_name, attr_val)
+
+        return state      # 仅本 rank，外层 Saver 会负责 all‑gather & merge
 
     def eval(self):
         self.transformer.eval()
@@ -876,8 +1056,8 @@ class InitialLayer(nn.Module):
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
                 
-        if len(inputs) == 8:
-            x, y, t, context, text_seq_lens, clip_fea, id_tokens, id_lens = inputs
+        if len(inputs) == 9:
+            x, y, t, context, text_seq_lens, clip_fea, id_tokens, id_lens, face_emb = inputs
         else:  # 旧路径 (无 adapter)
             x, y, t, context, text_seq_lens, clip_fea = inputs
             id_tokens, id_lens = None, None
@@ -936,7 +1116,7 @@ class InitialLayer(nn.Module):
         seq_lens = seq_lens.to(x.device)
         grid_sizes = grid_sizes.to(x.device)
 
-        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context, id_tokens, id_lens)
+        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context, id_tokens, id_lens, face_emb)
 
 
 class TransformerLayer(nn.Module):
@@ -948,7 +1128,7 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, e, e0, seq_lens, grid_sizes, freqs, context, id_tokens, id_lens = inputs
+        x, e, e0, seq_lens, grid_sizes, freqs, context, id_tokens, id_lens, face_emb = inputs
 
         self.offloader.wait_for_block(self.block_idx)
         # x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
@@ -960,7 +1140,7 @@ class TransformerLayer(nn.Module):
 
         # return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
         return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs,
-                               context, id_tokens, id_lens)
+                               context, id_tokens, id_lens, face_emb)
 
 
 class FinalLayer(nn.Module):

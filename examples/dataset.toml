@@ -44,10 +44,14 @@ frame_buckets = [1, 17, 33, 65, 97]
 # "tag1, tag2, tag3" has ", " as delimiter and will possibly be shuffled like "tag3, tag1, tag2". "tag1;tag2;tag3" has ";" as delimiter and will possibly be shuffled like "tag2;tag1;tag3".
 # cache_shuffle_delimiter = ", "
 
+# --- Face-ID Loss ---
+use_id_loss     = true     # <- 额外字段
+id_loss_weight  = 0.1      # λ_id
+
 [[directory]]
 # Path to directory of images/videos, and corresponding caption files. The caption files should match the media file name, but with a .txt extension.
 # A missing caption file will log a warning, but then just train using an empty caption.
-path = '/data/bohong/diffusion-pipe/data/input/single_video_0.25'
+path = '/data/bohong/data/ConsisID-preview-Data/videos/caption_videos_afterCrop'
 
 # You can do masked training, where the mask indicates which parts of the image to train on. The masking is done in the loss function. The mask directory should have mask
 # images with the same names (ignoring the extension) as the training images. E.g. training image 1.jpg could have mask image 1.jpg, 1.png, etc. If a training image doesn't
