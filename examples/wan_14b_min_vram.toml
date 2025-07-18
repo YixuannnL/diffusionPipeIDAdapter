@@ -8,7 +8,7 @@ dataset = 'examples/dataset.toml'
 # training settings
 epochs = 1000
 micro_batch_size_per_gpu = 1
-pipeline_stages = 2
+pipeline_stages = 1
 gradient_accumulation_steps = 1
 gradient_clipping = 1
 warmup_steps = 10
@@ -51,7 +51,7 @@ keep_vae_gpu = true
 type           = "video_id"
 num_id_tokens  = 16
 layers         = [12, 15, 18, 21] # 0: Initial 1:Adapter 所以打印出来的层数会+2
-adapter_dim = 2048
+adapter_dim    = 2048
 num_layers     = 4
 num_heads      = 16
 mlp_ratio      = 4

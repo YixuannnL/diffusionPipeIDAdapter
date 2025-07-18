@@ -739,6 +739,7 @@ if __name__ == '__main__':
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
+        model._global_step = step
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
@@ -746,11 +747,13 @@ if __name__ == '__main__':
         if step % config['logging_steps'] == 0:
             # ---------------------------------  gather id‑loss  ---------------------------------
             # 这段必须所有 rank 都执行，否则通信会死锁
-            id_loss_tensor = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
+            id_loss_tensor = torch.zeros(2, device=torch.cuda.current_device(), dtype=torch.float32)
 
             local_id_loss = getattr(model, "_last_id_loss", None)
             if local_id_loss is not None:                 # 只在最后一个 stage 为真
-                id_loss_tensor[0] = float(local_id_loss)
+                raw, scale = local_id_loss
+                id_loss_tensor[0] = float(raw)
+                id_loss_tensor[1] = float(scale)
             # 只有最后一个 stage 才带这个属性
             if hasattr(model, '_last_id_loss'):
                 model._last_id_loss = None
@@ -764,11 +767,13 @@ if __name__ == '__main__':
         if is_main_process():
             tb_writer.add_scalar(f'train/loss', loss, step)
             
-            id_loss_val = id_loss_tensor.item()
+            id_loss_val = id_loss_tensor[0].item()
             if id_loss_val > 0:                        # 0 代表这一步没算到 id‑loss
-                tb_writer.add_scalar('train/id_loss', id_loss_val, step)
+                raw, w = id_loss_tensor[0], id_loss_tensor[1]
+                tb_writer.add_scalar('train/id_loss_raw', raw, step)
+                tb_writer.add_scalar('train/id_loss_weight', w, step)
                 if wandb_enable:
-                    wandb.log({'train/id_loss': id_loss_val, 'step': step})
+                    wandb.log({'train/id_loss': raw, 'step': step})
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': step})
             if optimizer.__class__.__name__ == 'Prodigy':
