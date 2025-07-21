@@ -299,13 +299,15 @@ class WanAttentionBlock(nn.Module):
                                                                       eps)
         
         # 专用 cross-attn for ID-tokens
-        self.use_id_tokens = use_id_tokens
+        self.use_id_tokens = use_id_tokens # self.use_id_tokens 的默认值是 False；只有在显式指定要加IDToken的那几层时才会被改成 True
         if self.use_id_tokens:
             self.id_cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
                 dim, num_heads, (-1, -1), qk_norm, eps
             )
+            self.alpha_id = nn.Parameter(torch.full((dim,), 1e-3))
         else:
             self.id_cross_attn = None
+            self.alpha_id      = None
         
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
@@ -314,9 +316,6 @@ class WanAttentionBlock(nn.Module):
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        
-        # === NEW: residual‑scaling gates (ReZero style) ===
-        self.alpha_id  = nn.Parameter(torch.zeros(dim))   # 对 id‑cross‑attn
 
     def forward(
         self,
@@ -357,20 +356,15 @@ class WanAttentionBlock(nn.Module):
                 torch.float8_e4m3fn, torch.float8_e5m2) else x.dtype
             
             # text cross-attn
-            y_txt = self.cross_attn(self.norm3(x), context, context_lens)
+            y_txt = self.cross_attn(self.norm3(x), context, context_lens).to(work_dtype)
+            x_work = x.to(work_dtype)
             # id-token cross-attn
             if self.id_cross_attn is not None and id_tokens is not None:
-                y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens)
+                y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens).to(work_dtype)
+                x = x_work + y_txt + self.alpha_id.to(work_dtype) * y_id
             else:
-                y_id = 0
-                
-            y_txt = y_txt.to(work_dtype)
-            y_id  = y_id.to(work_dtype) if isinstance(y_id, torch.Tensor) else y_id
-            alpha_id  = self.alpha_id.to(work_dtype)
-            x_work = x.to(work_dtype)
-                
-            # x = x + y_txt + y_id * self.alpha_id
-            x = x_work + y_txt + alpha_id * y_id
+                x = x_work + y_txt
+
             # 如果原来是 fp8，就降回去；否则保持
             if work_dtype != x_work.dtype:
                 x = x.to(x_work.dtype)
@@ -601,14 +595,15 @@ class WanPipeline(BasePipeline):
                     blk.cross_attn.q.weight.device,
                     dtype=self.model_config["dtype"],      # 强制 bfloat16 / fp16
                 )
+            if getattr(blk, "alpha_id", None) is None:
+                blk.alpha_id = torch.nn.Parameter(
+                    torch.full((blk.dim,), 1e-3, dtype=self.model_config["dtype"]),
+                    requires_grad=True,
+                )
+                blk.alpha_id.original_name = f"blocks.{idx}.alpha_id"
             # --- 给新建 cross-attn 的每个参数打 original_name ---
             for n, p in blk.id_cross_attn.named_parameters():
                 p.original_name = f"blocks.{idx}.id_cross_attn.{n}"
-        # 让 α gate 继续参与训练
-        for idx in inject_layers:
-            blk = self.transformer.blocks[idx]
-            if hasattr(blk, "alpha_id"):
-                blk.alpha_id.requires_grad_(True)
                 
         # 4) 给 Adapter 自身权重打 original_name
         for n, p in self.video_id_adapter.named_parameters():

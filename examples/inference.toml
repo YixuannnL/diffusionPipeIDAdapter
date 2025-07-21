@@ -1,0 +1,29 @@
+[model]
+type         = "wan"                                  # WanPipeline
+ckpt_path    = "/data/bohong/model/Wan2.1-T2V-14B"    # Wan 2.1 base
+dtype        = "bfloat16"                             # 推理主 dtype
+transformer_dtype = "float8"                          # Flash‑Attn/QKV dtype
+guidance     = 7.5                                    # classifier‑free guidance scale
+keep_vae_gpu = true                                   # 避免频繁 CPU↔GPU 复制
+
+# Video‑ID adapter（权重文件含 adapter + id_cross_attn 权重）
+[adapter]
+type              = "video_id"
+ckpt_path           = "/data/bohong/diffusion-pipe/data/output/20250718_04-31-30/epoch1/video_id_adapter.safetensors"
+num_id_tokens     = 16
+adapter_dim       = 2048
+num_layers        = 4
+num_heads         = 16
+mlp_ratio         = 4
+dropout           = 0.0
+layers            = [12, 15, 18, 21]                  # 与训练保持一致
+dtype             = "bfloat16"                        # adapter 参数 dtype
+
+# 默认生成设置，可被 CLI 参数覆盖
+[generation]
+num_frames   = 81
+height       = 512
+width        = 512
+seed         = 42
+steps        = 50
+fps          = 16
