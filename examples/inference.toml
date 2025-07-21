@@ -9,7 +9,7 @@ keep_vae_gpu = true                                   # 避免频繁 CPU↔GPU �
 # Video‑ID adapter（权重文件含 adapter + id_cross_attn 权重）
 [adapter]
 type              = "video_id"
-ckpt_path           = "/data/bohong/diffusion-pipe/data/output/20250718_04-31-30/epoch1/video_id_adapter.safetensors"
+ckpt_path           = "/data/bohong/diffusion-pipe/data/output/20250718_04-51-51/epoch12/video_id_adapter.safetensors"
 num_id_tokens     = 16
 adapter_dim       = 2048
 num_layers        = 4

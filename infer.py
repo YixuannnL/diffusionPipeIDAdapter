@@ -44,6 +44,7 @@ from torchvision import transforms as T
 
 import wan                                    
 from wan import configs as wan_cfgs
+from wan.configs import SIZE_CONFIGS, MAX_AREA_CONFIGS
 from torchvision import transforms as Tv
 
 # --------------------  dtype helpers  --------------------
@@ -175,7 +176,7 @@ def _build_runner(pipe, device_id: int = 0):
 
     # ---- 重用训练时已在 GPU 的权重，包含 video‑id‑adapter ----
     runner.model        = pipe.transformer                 # DiT 主干
-    runner.vae          = pipe.vae.model                   # Wan‑VAE
+    runner.vae          = pipe.vae                         # Wan‑VAE
     runner.text_encoder = pipe.text_encoder                # UM‑T5
     if getattr(pipe, "video_id_adapter", None):
         runner.model.video_id_adapter = pipe.video_id_adapter
@@ -192,45 +193,72 @@ def build_model(cfg: dict, device: torch.device, dtype: torch.dtype, compile_gra
     from utils.common import DTYPE_MAP  # same mapping used in training
 
     # 1) Create pipeline skeleton (no weights yet)
-    from models import wan as wan_mod
-    pipe = wan_mod.WanPipeline(cfg)
+    from models import wan
+    pipe = wan.WanPipeline(cfg)
 
-    # 2) Diffusion / VAE weights (base model)
-    pipe.load_diffusion_model()  # uses cfg['model']['ckpt_path'] internally
+    # -------------------------------------------------------------
+    # 2) ── Diffusion / VAE 主干（基础权重）
+    # -------------------------------------------------------------
+    pipe.load_diffusion_model()   # 内部已把 transformer 塞进 pipe.transformer
 
-    # 3) Adapter (Video‑ID)
-    adapter_cfg = cfg.get("adapter", None)
-    if not adapter_cfg:
-        raise ValueError("Adapter section missing in config – required for identity preservation.")
-
-    pipe.configure_adapter(adapter_cfg)
-
-    # 4) Load fine‑tuned weights (video_id_adapter.safetensors).  
-    #    Path precedence: (a) CLI arg, (b) adapter_cfg['ckpt_path']
-    adapter_ckpt = adapter_cfg.get("ckpt_path")
+    # === 找出 base ckpt 仍未提供的参数（被填 0 的） ===
+    missing_after_base = []
+    for n, p in pipe.transformer.named_parameters():
+        if torch.all(p == 0):          # WanModelFromSafetensors 会用 0 占位
+            missing_after_base.append(n)
+    # -------------------------------------------------------------
+    # 3) ── Video‑ID Adapter（包含 blocks.*.id_cross_attn / alpha_id 权重）
+    # -------------------------------------------------------------
+    adapter_cfg = cfg.get("adapter", {})
+    if adapter_cfg and adapter_cfg.get("type") == "video_id":
+        pipe.configure_adapter(adapter_cfg)
+    
+    adapter_ckpt = cfg.get("adapter", {}).get("ckpt_path")
     if adapter_ckpt is None:
-        raise ValueError("Please specify adapter.ckpt_path in the TOML config.")
-    # 找到合适的加载函数（不同分支名字略有差异）
+        raise ValueError("Please specify adapter.ckpt_path in the TOML.")
+
+    from safetensors.torch import load_file
+    full_sd = load_file(adapter_ckpt, device='cpu')
+
+    # 3‑A  把 blocks.* 权重先尝试补进 transformer
+    xattn_sd = {k: v for k, v in full_sd.items() if k.startswith("blocks.")}
+
+    if xattn_sd:
+        incomp, unexp = pipe.transformer.load_state_dict(xattn_sd, strict=False)
+        print(f"unexpected={len(unexp)}")
+
+    # 3‑B  再让适配器本体去加载自己那部分
     load_fn = (
         getattr(pipe, "load_video_id_adapter_weights", None)
         or getattr(pipe, "load_adapter_weights", None)
     )
-    if load_fn is None:
-        raise AttributeError("Pipeline object has no adapter‑loading method.")
     load_fn(adapter_ckpt)
 
+    # === 统计最终仍缺失的 key（仍是 0）并打印 ===
+    still_missing = []
+    for n, p in pipe.transformer.named_parameters():
+        if torch.all(p == 0):
+            still_missing.append(n)
+
+    print(f"[adapter] ⚠️  missing after base‑ckpt: {len(missing_after_base)}, "
+        f"after adapter补齐仍缺: {len(still_missing)}")
+    if still_missing:
+        for k in still_missing[:20]:          # 只打印前 20 个，够你快速定位
+            print("   ", k)
+    
     # Optional compilation —— **只编 transformer 子模块**
     if compile_graph and hasattr(torch, "compile"):
         try:
             pipe.transformer = torch.compile(
                 pipe.transformer,                 # 仅编译 nn.Module
                 mode="reduce-overhead",
-                fullgraph=True,
+                fullgraph=False,
+                dynamic=True,
             )
             print("[Speed-up] torch.compile on transformer ✅")
         except Exception as e:
             # 编译失败时退化为正常执行，避免整脚本崩溃
-            print(f"[Speed-up] torch.compile skipped ({e})")
+            print(f"[Speed‑up] torch.compile skipped ➜ fallback to eager ({e})")
 
     return pipe
 
@@ -248,29 +276,56 @@ def generate_video(
     device_id = torch.cuda.current_device()
     runner, wand_cfg = _build_runner(pipe, device_id)
 
-    extra = {}
+    extra_kwargs = {}
     if pipe.i2v:
         first = (ref_vid[0].clamp(-1,1).add(1).mul_(127.5)
                  .to(torch.uint8).cpu())        # [3,H,W] uint8
-        extra["src_image"] = Tv.ToPILImage()(first)
+        extra_kwargs["src_image"] = Tv.ToPILImage()(first)
     elif pipe.flf2v:
-        extra["first_frame"] = ref_vid[0]
-        extra["last_frame"]  = ref_vid[-1]
+        extra_kwargs["first_frame"] = ref_vid[0]
+        extra_kwargs["last_frame"]  = ref_vid[-1]
+        
+    # -------------------- 通用采样参数 --------------------
+    # 如果 TOML 里有 size="1280*720" 就用，没有就默认 1280*720
+    size_str = cfg.get("size", "1280*720")
+    size_tuple = SIZE_CONFIGS.get(size_str, SIZE_CONFIGS["1280*720"])
+
+    # I2V / FLF2V 用 max_area 而不是 size
+    max_area = MAX_AREA_CONFIGS[size_str]
+
+    common_args = dict(
+        frame_num      = num_frames,
+        shift          = cfg.get("sample_shift", 5.0),
+        sample_solver  = cfg.get("sample_solver", "unipc"),
+        sampling_steps = cfg.get("sample_steps", 50),
+        guide_scale    = guidance,
+        seed           = seed,
+        offload_model  = False,
+    )
 
     # ------------ 正式采样 ------------
     with torch.autocast("cuda", dtype=ref_vid.dtype):
-        video = runner.generate(
-            prompt,
-            **extra,
-            size=(wand_cfg.width, wand_cfg.height),
-            frame_num=num_frames,
-            shift=wand_cfg.sample_shift if hasattr(wand_cfg, "sample_shift") else 5.0,
-            sample_solver="unipc",
-            sampling_steps=wand_cfg.sample_steps if hasattr(wand_cfg, "sample_steps") else 50,
-            guide_scale=guidance,
-            seed=seed,
-            offload_model=False,
-        )   # 返回 (C, F, H, W)  ·[-1,1]
+        if pipe.i2v:
+            video = runner.generate(
+                prompt,
+                extra_kwargs["src_image"],
+                max_area=max_area,
+                **common_args,
+            )
+        elif pipe.flf2v:
+            video = runner.generate(
+                prompt,
+                extra_kwargs["first_frame"],
+                extra_kwargs["last_frame"],
+                max_area=max_area,
+                **common_args,
+            )
+        else:  # t2v / t2i
+            video = runner.generate(
+                prompt,
+                size=size_tuple,
+                **common_args,
+            )
 
     video = (video.clamp_(-1,1).add_(1).mul_(127.5)).to(torch.uint8)
     video = video.permute(1, 0, 2, 3).contiguous()      # -> [F,3,H,W]
