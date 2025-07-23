@@ -2,7 +2,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
 
 class PositionalEncoding(nn.Module):
     """
@@ -53,9 +53,15 @@ class VideoIDAdapter(nn.Module):
         proj_in_channels: Optional[int] = None,  # 若 None, 用 LazyLinear
         adapter_dim: int = 1024,     # 内部瓶颈宽度
         dropout: float = 0.0,
+        grid_size: Tuple[int, int] = (8, 8),     # 空间采样网格 (g_h, g_w)
+        pool_mode: str = "grid",                 # "grid" | "mean" | "center"
     ):
         super().__init__()
         self.num_id_tokens = num_id_tokens
+        # ----- 控制采样策略 -----
+        self.grid_h, self.grid_w = grid_size      # 默认 8 × 8 网格
+        self.pool_mode = pool_mode.lower()        # 可选 "grid" / "mean" / "center"
+        # -----  
         self.hidden_size = hidden_size
         self.adapter_dim = adapter_dim
 
@@ -92,12 +98,36 @@ class VideoIDAdapter(nn.Module):
         return id_tokens: [B, N, D]
         """
         B, C, F, H, W = latents.shape               # 16 / 17 / 160 / 90
-        g_h, g_w = 4, 4
-        h_idx = torch.linspace(0, latents.size(3)-1, g_h).long()
-        w_idx = torch.linspace(0, latents.size(4)-1, g_w).long()
-        lat_sel = latents[:, :, :, h_idx][:, :, :, :, w_idx]   # [B,C,F,4,4]
-        x = lat_sel.permute(0, 2, 3, 4, 1).reshape(B, F*g_h*g_w, C)  # 把 [B,C,F,4,4] → [B, F, 4, 4, C] → [B, L, C]，形成每个采样点一个 token 的时空序列  
-        L = F  # 序列长度
+        # ------------------------------------------------------------------
+        # 先把 VAE latent 变成时序 token 序列  (B, seq_len, C)
+        # ------------------------------------------------------------------
+        if self.pool_mode == "grid":
+            g_h, g_w = self.grid_h, self.grid_w
+            # 在高、宽两个方向上取均匀网格中心的索引
+            h_idx = torch.linspace(0, H - 1, g_h, device=latents.device).long()
+            w_idx = torch.linspace(0, W - 1, g_w, device=latents.device).long()
+            lat_sel = (
+                latents.index_select(-2, h_idx)          # 选高度
+                .index_select(-1, w_idx)          # 选宽度
+            )                                            # [B,C,F,g_h,g_w]
+            x = lat_sel.permute(0, 2, 3, 4, 1)           # [B,F,g_h,g_w,C]
+            x = x.reshape(B, F * g_h * g_w, C)           # 展平成序列
+
+        elif self.pool_mode == "mean":
+            # 对 H、W 做全局平均池化
+            x = latents.mean(dim=(-2, -1))               # [B,C,F]
+            x = x.permute(0, 2, 1)                      # [B,F,C]
+
+        elif self.pool_mode == "center":
+            # 直接取中心像素
+            x = latents[..., H // 2, W // 2]             # [B,C,F]
+            x = x.permute(0, 2, 1)                       # [B,F,C]
+
+        else:
+            raise ValueError(f"Unknown pool_mode '{self.pool_mode}'")
+        # ------------------------------------------------------------------
+        # 线性降维到 adapter_dim 并加绝对 PE
+        # ------------------------------------------------------------------
         x = self.in_proj(x)                         # [B, L, D] in_proj: C → adapter_dim
         x = self.pos_enc(x)                         # 为序列中每个位置添加可微分的绝对正弦余弦位置信息，使 Transformer 能区分 token 在时间/空间序列上的先后
 
@@ -106,9 +136,11 @@ class VideoIDAdapter(nn.Module):
         x = torch.cat([id_tok, x], dim=1)           # [B, N+L, D] 把它们“ prepend” 到时空 token 序列前面，让 Transformer 可以用后续的自注意力把时空信息汇聚到这些 ID token 上
 
         x = self.transformer(x)                     # same shape
-
+        # ------------------------------------------------------------------
+        # 取出前 N 个 ‑[ID]‑token → 投回 Wan hidden_size=5120
+        # ------------------------------------------------------------------
         out = x[:, :self.num_id_tokens, :]          # [B,N, adapter_dim] 取出经 Transformer 更新后的前 N 个 “身份” token
-        # 映射回 Wan hidden_size=5120 供 cross-attn 用一个全连接把 adapter_dim 投回与 Wan cross-attn 相同的维度（5120），以便后续注入到主模型的 cross-attn 中
+
         return self.out_proj(out)
 
     # output projection weights（trainable）

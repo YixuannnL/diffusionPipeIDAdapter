@@ -570,6 +570,8 @@ class WanPipeline(BasePipeline):
             mlp_ratio         = adapter_config.get('mlp_ratio', 4),
             dropout           = adapter_config.get('dropout', 0.0),
             proj_in_channels  = latent_ch,
+            grid_size         = (adapter_config.get('grid_size', 8)[0], adapter_config.get('grid_size', 8)[1]),
+            pool_mode         = adapter_config.get('pool_mode', "grid"),
         ).to(self.model_config['dtype'])
 
         # 2) 冻结 Wan-Transformer

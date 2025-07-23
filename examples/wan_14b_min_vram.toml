@@ -56,6 +56,8 @@ num_layers     = 4
 num_heads      = 16
 mlp_ratio      = 4
 dropout        = 0.0
+grid_size      = [8, 8] # 可以调得更密一点
+pool_mode      = "grid" # 或 "mean" / "center"
 
 [optimizer]
 type = 'AdamW8bitKahan'
