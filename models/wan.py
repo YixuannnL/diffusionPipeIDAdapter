@@ -575,7 +575,7 @@ class WanPipeline(BasePipeline):
         # 2) 冻结 Wan-Transformer
         for p in self.transformer.parameters():
             p.requires_grad_(False)
-
+            
         # 3) 把指定层打上 use_id_tokens=True 并加 id_cross_attn
         inject_layers = adapter_config.get('layers', [])
         for idx in inject_layers:
@@ -621,6 +621,63 @@ class WanPipeline(BasePipeline):
         # 5) 把 Adapter 参数加入训练列表
         for p in self.video_id_adapter.parameters():
             p.requires_grad_(True)
+            
+        # ------------------------------------------------------------------
+        # 在 selected blocks 上挂 4‑bit LoRA （v_proj / out_proj）
+        # ------------------------------------------------------------------
+        if adapter_config.get("enable_value_lora", True):
+            from peft.tuners.lora import LoraConfig, LoraModel
+            from peft import prepare_model_for_kbit_training
+            from peft import get_peft_model
+
+            # 哪几层挂 LoRA ＝ adapter_config['layers']
+            lora_layers = adapter_config.get("layers", [])
+            if not lora_layers:
+                raise ValueError(
+                    "[LoRA] adapter.layers 为空；请在 TOML 里显式指定要注入的 block 索引列表"
+                )
+            print(f"[LoRA] apply 4‑bit LoRA to blocks: {lora_layers}")
+
+            # PEFT LoRA 配置
+            lora_cfg = LoraConfig(
+                r=8,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                target_modules=["v", "o"],   # Wan*Attention 命名
+                task_type="FEATURE_EXTRACTION",
+            )
+
+            for idx in lora_layers:
+                blk = self.transformer.blocks[idx]
+                for name in ("self_attn", "cross_attn"):
+                    attn = getattr(blk, name)
+                    # ① 把内部 Linear 换成 4‑bit 权重（freeze）
+                    attn = prepare_model_for_kbit_training(
+                        attn, use_gradient_checkpointing=False
+                    )
+                    # ② 对 Linear 注入 LoRA
+                    attn = get_peft_model(attn, lora_cfg, adapter_name=f"blk{idx}_{name}")
+                    # ③ 打 original_name 便于 Saver 收集
+                    for n, p in attn.named_parameters():
+                        if p.requires_grad:
+                            p.original_name = (
+                                f"blocks.{idx}.{name}.{n.replace('.', '_')}"
+                            )
+            
+        # ------------------------------------------------------------------
+        #  LayerNorm γ / β 解冻
+        # ------------------------------------------------------------------
+        for m in self.transformer.modules():
+            if isinstance(m, torch.nn.LayerNorm) and m.elementwise_affine:
+                m.weight.requires_grad_(True)
+                if m.bias is not None:
+                    m.bias.requires_grad_(True)
+                # 打 name
+                for n, p in m.named_parameters(recurse=False):
+                    p.original_name = (
+                        f"blocks_layernorm.{id(m)}.{n}"  # 唯一即可
+                    )
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
@@ -691,7 +748,10 @@ class WanPipeline(BasePipeline):
                 cross_cls = blk.cross_attn.__class__
                 blk.id_cross_attn = cross_cls(
                     blk.dim, blk.num_heads, (-1,-1),
-                    blk.qk_norm, blk.eps
+                    # blk.qk_norm, 
+                    # blk.eps
+                    getattr(blk.cross_attn, "model", blk.cross_attn).qk_norm,
+                    getattr(blk.cross_attn, "model", blk.cross_attn).eps,
                 ).to(dtype=self.model_config["dtype"], device='cuda')
                 
         # ---------- 3.  load weights ----------
