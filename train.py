@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 import wandb
 from datetime import datetime, timezone
 import shutil
@@ -740,6 +741,10 @@ if __name__ == '__main__':
         num_steps += 1
         train_dataloader.sync_epoch()
         model._global_step = step
+        
+        # -------- alpha warm‑up：1 k 步线性上升到 1.0 --------
+        warm_scale = min(1.0, step / 1_000)
+        model.set_alpha_scale(warm_scale)
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False

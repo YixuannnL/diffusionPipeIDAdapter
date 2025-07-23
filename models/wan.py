@@ -595,11 +595,21 @@ class WanPipeline(BasePipeline):
                     dtype=self.model_config["dtype"],      # 强制 bfloat16 / fp16
                 )
             if getattr(blk, "alpha_id", None) is None:
-                blk.alpha_id = torch.nn.Parameter(
-                    torch.full((blk.dim,), 1e-3, dtype=self.model_config["dtype"]),
-                    requires_grad=True,
-                )
+                mean_val = blk.cross_attn.o.weight.float().mean().to(self.model_config["dtype"])
+                blk.alpha_id = torch.nn.Parameter(mean_val.expand(blk.dim).clone(), requires_grad=True)
+                # blk.alpha_id = torch.nn.Parameter(
+                #     torch.full((blk.dim,), 1e-3, dtype=self.model_config["dtype"]),
+                #     requires_grad=True,
+                # )
                 blk.alpha_id.original_name = f"blocks.{idx}.alpha_id"
+                
+                # 记录 warm‑up 目标值（0.05）——存在 buffer 里，训练循环再按比例写回
+                blk.register_buffer("_alpha_target",
+                                    torch.full((1,), 0.05,
+                                               dtype=self.model_config["dtype"]),
+                                    persistent=False)
+                # 注册梯度放大 hook：所有 alpha_id 的 grad ×10
+                blk.alpha_id.register_hook(lambda g: g * 10.0)
             # --- 给新建 cross-attn 的每个参数打 original_name ---
             for n, p in blk.id_cross_attn.named_parameters():
                 p.original_name = f"blocks.{idx}.id_cross_attn.{n}"
@@ -1012,6 +1022,13 @@ class WanPipeline(BasePipeline):
         if hasattr(self, "video_id_adapter") and self.video_id_adapter is not None:
             self.video_id_adapter.eval()
         return self
+    
+    # -------- 按 warm‑up 进度把 alpha_id 写成目标值 × scale --------
+    def set_alpha_scale(self, scale: float):
+        """在训练循环里每个 step 调一次, scale∈[0,1]"""
+        for blk in self.transformer.blocks:
+            if hasattr(blk, "alpha_id") and hasattr(blk, "_alpha_target"):
+                blk.alpha_id.data.copy_(blk._alpha_target * scale)
 
 class InitialLayer(nn.Module):
     def __init__(self, model):
