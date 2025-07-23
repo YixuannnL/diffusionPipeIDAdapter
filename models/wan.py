@@ -349,8 +349,7 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         # def cross_attn_ffn(x, context, context_lens, e):
             # x = x + self.cross_attn(self.norm3(x), context, context_lens)
-        def cross_attn_ffn(x, context, context_lens, id_tokens, id_lens, e):
-            
+        def cross_attn_ffn(x, context, context_lens, id_tokens, id_lens, e):                      
             # 选一个“工作 dtype”：如果当前是 fp8，就升到 bf16，否则保持不变
             work_dtype = torch.bfloat16 if x.dtype in (
                 torch.float8_e4m3fn, torch.float8_e5m2) else x.dtype
@@ -503,8 +502,8 @@ class WanPipeline(BasePipeline):
             from models.face_encoder import FaceEncoder
             self.face_encoder = FaceEncoder(device='cpu')
             
-            self.id_loss_base          = self.config.get("id_loss_weight", 0.1)
-            self.id_loss_warmup_steps  = self.config.get("id_loss_warmup_steps", 5_000)
+            self.id_loss_base          = self.config.get("id_loss_weight", 0.3)
+            self.id_loss_warmup_steps  = self.config.get("id_loss_warmup_steps", 3_000)
             self._global_step          = 0
         else:
             self.face_encoder = None
@@ -633,7 +632,7 @@ class WanPipeline(BasePipeline):
         ③ 加载权重
         """
         sd = load_file(weights_file, device='cpu')
-
+        
         # ---------- 1.  若 adapter 不存在 → 根据 state_dict 推断并创建 ----------
         if getattr(self, "video_id_adapter", None) is None:
             # 1) 基础形状信息
@@ -684,7 +683,7 @@ class WanPipeline(BasePipeline):
                     blk.dim, blk.num_heads, (-1,-1),
                     blk.qk_norm, blk.eps
                 ).to(dtype=self.model_config["dtype"], device='cuda')
-
+                
         # ---------- 3.  load weights ----------
         # 3.1 adapter
         adpt_kv = {k.replace("video_id_adapter.", ""): v for k,v in sd.items()
@@ -696,7 +695,7 @@ class WanPipeline(BasePipeline):
         xattn_kv = {k:v for k,v in sd.items() if k.startswith("blocks.")}
         miss2, unexp = self.transformer.load_state_dict(xattn_kv, strict=False)
         print(f"id_cross missing={len(miss2)}, unexpected={len(unexp)}")
-
+        
         # ---------- 4.  done ----------
         self.adapter_type = "video_id"
         
@@ -867,7 +866,7 @@ class WanPipeline(BasePipeline):
         return (
             # (x_t, y, t, text_embeddings, seq_lens, clip_context),
             (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens, face_emb),
-            (target, mask, face_emb),
+            (target, mask, face_emb, x_t.detach(), t.detach()),
         )
 
     def to_layers(self):
@@ -914,15 +913,15 @@ class WanPipeline(BasePipeline):
     def get_loss_fn(self):
         mse = torch.nn.MSELoss(reduction="none")          # 与原实现一致
         
-        def decode_ckpt(vae, lat, scale):
+        def _decode_and_embed(z):
             """
-            内部函数必须只收 Tensor；把列表拆开。
+            z : (B, C, H, W)  [-latent-]    (不含帧维度)
+            返回 : (B, 512)     已 L2‑norm
             """
-            def _run(z):                  # z 形状 (C,H,W)
-                out = vae.model.decode(z.unsqueeze(0), scale)[0]
-                return out
-
-            return cp.checkpoint(_run, lat, use_reentrant=False)      # 激活在 backward 时重算
+            rgb = self.vae.model.decode(z, self.vae.scale)            # [-1, 1]
+            rgb = rgb.clamp_(-1, 1)
+            emb = self.face_encoder(rgb)                         # (B,512)
+            return emb
 
         # 通过闭包捕获 self
         def loss_fn(model_output, label):
@@ -932,20 +931,13 @@ class WanPipeline(BasePipeline):
             return       : scalar loss
             """
             # ----------- 1. 解析 label -----------
-            if len(label) == 3:
-                target, mask, ref_face = label
-            else:                       # 兼容旧缓存
-                target, mask = label
-                ref_face = None
-
-            # ----------- 2. 扩散 MSE/V-pred 损失 -----------
-            # 保证 dtype 一致，避免 Float/BF16 混用导致的反向传播错误
+            target, mask, ref_face, x_t, t = label
             target = target.to(model_output.dtype)
+
+            # ----------- 2. 扩散 MSE/V-pred 损失 -----------   
+            diff_loss = mse(model_output, target)        
             if mask is not None and mask.numel():
-                mask = mask.to(model_output.dtype)
-            diff_loss = mse(model_output, target)
-            if mask is not None and mask.numel():
-                diff_loss = diff_loss * mask
+                diff_loss = diff_loss * mask.to(diff_loss.dtype)
             diff_loss = diff_loss.mean()
 
             total_loss = diff_loss                         # 初始化总损失
@@ -956,45 +948,37 @@ class WanPipeline(BasePipeline):
                 (ref_face is not None) and                 # 数据里带 ref 向量
                 ref_face.abs().sum() > 0                   # 不是全 0（= 未检出脸）
             ):
-                # (a) 取预测首帧 latent → decode → [-1,1]
-                i = torch.randint(0, model_output.size(2), (1,)).item()
-                first_lat = model_output[:, :, i:i+1, :, :].squeeze(0)                 # (B,C,1,H,W) -> (C,1,H,W)              
-                first_lat_device = first_lat.to(dtype=self.vae.dtype, memory_format=torch.contiguous_format)
-                target_device = first_lat_device.device
-                if not self._vae_on_cuda:
-                    # (1) 移动 VAE 主体
-                    self.vae.model.to(target_device)
-                    # (2) 移动统计量并重新缓存 scale
-                    self.vae.mean = self.vae.mean.to(target_device)
-                    self.vae.std  = self.vae.std.to(target_device)
+                t_exp = t.view(-1, 1, 1, 1, 1).to(model_output.dtype)
+                x1_pred = x_t.to(model_output.dtype) - t_exp * model_output
+                # i = torch.randint(0, model_output.size(2), (1,)).item() # 随机取一帧
+                lat = x1_pred[:, :, 0:1, :, :]
+                lat = lat.to(dtype=self.vae.dtype, memory_format=torch.contiguous_format)
+                
+                dev = lat.device
+                if not self._vae_on_cuda or next(self.vae.model.parameters()).device != dev:
+                    self.vae.model.to(dev)
+                    self.vae.mean  = self.vae.mean.to(dev)
+                    self.vae.std   = self.vae.std.to(dev)
                     self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
-                    self.vae.device = target_device
+                    self.face_encoder.to(dev)
                     self._vae_on_cuda = True
-                    
-                def _decode_and_embed(z):            # z.shape = (C,H,W)
-                    rgb = self.vae.model.decode(z.unsqueeze(0), self.vae.scale)[0]   # [-1,1]
-                    rgb = rgb.clamp_(-1, 1)
-                    rgb = rgb.squeeze(1).unsqueeze(0)
-                    emb = self.face_encoder(rgb)     # (1,512)
-                    return emb
-                
-                # lat_small  = F.interpolate(first_lat_device, scale_factor=0.5, mode='bilinear', align_corners=False).half()
+
+
                 emb_pred = torch.utils.checkpoint.checkpoint(
-                            _decode_and_embed, first_lat_device, use_reentrant=False
-                        ).float()
+                    _decode_and_embed, lat, use_reentrant=False
+                ).float()                        # ID 向量统一 float32
 
-                # (c) cosine 相似度 → ID-Loss
+                # (d) cosine 相似度 → loss
                 ref_face = ref_face.to(emb_pred.device, dtype=emb_pred.dtype)
-                cos_sim  = (emb_pred * ref_face).sum(dim=1)                # (B,)
+                cos_sim  = torch.sum(emb_pred * ref_face, dim=1)    # (B,)
                 id_loss  = (1 - cos_sim).mean().to(model_output.dtype)
-                
-                # 渐进式权重：前 warmup_steps 线性爬坡
-                scale      = min(1.0,  self._global_step / max(1, self.id_loss_warmup_steps))
-                total_loss = total_loss + self.id_loss_base * scale * id_loss
 
-                id_loss_val = id_loss.detach()
+                # (e) 逐步放大权重
+                scale_w  = min(1.0, self._global_step / max(1, self.id_loss_warmup_steps))
+                total_loss = total_loss + self.id_loss_base * scale_w * id_loss
+
                 if 'id_loss_val' in locals():
-                    self._last_id_loss = (id_loss.detach(), scale)  # 只存本地，先不通信
+                    self._last_id_loss = (id_loss.detach(), scale_w)  # 只存本地，先不通信
             # ----------- 4. 返回 -----------
             return total_loss
 

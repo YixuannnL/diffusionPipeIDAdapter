@@ -976,17 +976,13 @@ class PipelineDataLoader:
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
-            if len(label) == 3:
-                target, mask, face_emb = label
-            else:
-                target, mask = label
-                face_emb = None
+            target, mask, face_emb, x_t, t = label
             # The target depends on the noise, so we must broadcast it from the first stage to the last.
             # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
             # would line up on the first and last stage so that this doesn't deadlock.
             target = self._broadcast_target(target)
             if face_emb is not None:
-                label = (target, mask, face_emb)
+                label = (target, mask, face_emb, x_t, t)
             else:
                 label = (target, mask)
             self.num_batches_pulled += 1

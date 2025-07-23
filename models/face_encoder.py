@@ -32,8 +32,8 @@ class FaceEncoder(nn.Module):
         # [-1,1] → [0,1]
         x = (img + 1) * 0.5
         # Facenet 期望 160×160
-        x = F.interpolate(x, size=(160, 160), mode='bilinear', align_corners=False)
-        # Normalize：mean=0.5, std=0.5  → [-1,1]
+        
+        x = F.interpolate(x.squeeze(2), size=(160, 160), mode='bilinear', align_corners=False) # squeeze(2) 去掉 time 维度
         x = (x - 0.5) / 0.5
         emb = self.backbone(x)           # (B,512)
         return F.normalize(emb, p=2, dim=-1)

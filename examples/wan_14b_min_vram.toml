@@ -32,7 +32,7 @@ video_clip_mode = 'single_beginning'
 
 # --- Face-ID Loss ---
 use_id_loss     = true     # <- 额外字段
-id_loss_weight  = 0.1      # λ_id
+id_loss_weight  = 0.3      # λ_id
 
 keep_vae_gpu = true
 
