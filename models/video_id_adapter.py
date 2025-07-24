@@ -143,9 +143,19 @@ class VideoIDAdapter(nn.Module):
             }))
         self.transformer = nn.ModuleList(blocks)
         
-        # gating α_i  （初始化为 0 ≈ 平均权重）
+        # ========================= NEW =========================
+        # 1. 每‑token 独立线性映射  W_i, b_i
+        self.token_proj_weight = nn.Parameter(
+            torch.empty(num_id_tokens, hidden_size, adapter_dim)
+        )                               # (N, H, D)
+        self.token_proj_bias = nn.Parameter(
+            torch.zeros(num_id_tokens, hidden_size)
+        )                               # (N, H)
+        nn.init.kaiming_uniform_(self.token_proj_weight, a=math.sqrt(5))
+
+        # 2. gating α_i（初始化为 0，相当于均匀）
         self.alpha = nn.Parameter(torch.zeros(num_id_tokens))
-        self.out_proj = nn.Linear(adapter_dim, hidden_size, bias=True)
+        # =======================================================
 
     def forward(self, 
                 latents: torch.Tensor,
@@ -210,10 +220,21 @@ class VideoIDAdapter(nn.Module):
         # 取出前 N 个 ‑[ID]‑token → 投回 Wan hidden_size=5120
         # ------------------------------------------------------------------
         id_feat = x[:, :self.num_id_tokens, :]      # [B,N,D]
-        # gating
-        w = torch.softmax(self.alpha, dim=0)        # (N,)
-        pooled = (w.unsqueeze(0).unsqueeze(-1) * id_feat).sum(1)   # [B,D]
-        return self.out_proj(pooled).unsqueeze(1)   # [B,1,hidden]
+        
+        # ---------- 1. token‑wise全连接：D_a → hidden_size ----------
+        proj_out = torch.einsum("bnd,nhd->bnh",
+                                id_feat,                 # (B,N,D_a)
+                                self.token_proj_weight   # (N,H,D_a)
+                               )                         # → (B,N,H)
+        proj_out = proj_out + self.token_proj_bias.unsqueeze(0)   # broadcast bias
+
+        # ---------- 2. αᵢ gating ----------
+        w = torch.softmax(self.alpha, dim=0)                             # (N,)
+        proj_out = proj_out * w.unsqueeze(0).unsqueeze(-1)               # (B,N,H)
+
+        # ---------- 3. 把加权后的 N 个 token 直接返回 ----------
+        return proj_out
+     
 
     # output projection weights（trainable）
     # out_proj_weight: torch.Tensor

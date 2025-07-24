@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import wandb
 from datetime import datetime, timezone
 import shutil
