@@ -360,7 +360,8 @@ class WanAttentionBlock(nn.Module):
             # id-token cross-attn
             if self.id_cross_attn is not None and id_tokens is not None:
                 y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens).to(work_dtype)
-                x = x_work + y_txt + self.alpha_id.to(work_dtype) * y_id
+                alpha = (self.alpha_scale.to(work_dtype) * self.alpha_id.to(work_dtype))
+                x = x_work + y_txt + alpha * y_id
             else:
                 x = x_work + y_txt
 
@@ -604,14 +605,14 @@ class WanPipeline(BasePipeline):
                 #     requires_grad=True,
                 # )
                 blk.alpha_id.original_name = f"blocks.{idx}.alpha_id"
-                
-                # 记录 warm‑up 目标值（0.05）——存在 buffer 里，训练循环再按比例写回
-                blk.register_buffer("_alpha_target",
-                                    torch.full((1,), 0.05,
-                                               dtype=self.model_config["dtype"]),
-                                    persistent=False)
                 # 注册梯度放大 hook：所有 alpha_id 的 grad ×10
                 blk.alpha_id.register_hook(lambda g: g * 10.0)
+                # warm‑up 乘法标量，初始化为 0（常量，不参与梯度）
+                blk.register_buffer(
+                    "alpha_scale",
+                    torch.zeros(1, dtype=self.model_config["dtype"]),
+                    persistent=False,
+                )
             # --- 给新建 cross-attn 的每个参数打 original_name ---
             for n, p in blk.id_cross_attn.named_parameters():
                 p.original_name = f"blocks.{idx}.id_cross_attn.{n}"
@@ -659,7 +660,8 @@ class WanPipeline(BasePipeline):
                         attn, use_gradient_checkpointing=False
                     )
                     # ② 对 Linear 注入 LoRA
-                    attn = get_peft_model(attn, lora_cfg, adapter_name=f"blk{idx}_{name}")
+                    attn = LoraModel(attn, lora_cfg, adapter_name=f"blk{idx}_{name}")
+                    setattr(blk, name, attn)
                     # ③ 打 original_name 便于 Saver 收集
                     for n, p in attn.named_parameters():
                         if p.requires_grad:
@@ -1020,7 +1022,7 @@ class WanPipeline(BasePipeline):
                 (ref_face is not None) and                 # 数据里带 ref 向量
                 ref_face.abs().sum() > 0                   # 不是全 0（= 未检出脸）
             ):
-                t_exp = t.view(-1, 1, 1, 1, 1).to(model_output.dtype)
+                t_exp = (t / 1000).view(-1, 1, 1, 1, 1).to(model_output.dtype)
                 x1_pred = x_t.to(model_output.dtype) - t_exp * model_output
                 # i = torch.randint(0, model_output.size(2), (1,)).item() # 随机取一帧
                 lat = x1_pred[:, :, 0:1, :, :]
@@ -1089,9 +1091,8 @@ class WanPipeline(BasePipeline):
     def set_alpha_scale(self, scale: float):
         """在训练循环里每个 step 调一次, scale∈[0,1]"""
         for blk in self.transformer.blocks:
-            if hasattr(blk, "alpha_id") and hasattr(blk, "_alpha_target"):
-                blk.alpha_id.data.copy_(blk._alpha_target * scale)
-
+            if hasattr(blk, "alpha_scale"):
+                blk.alpha_scale.fill_(scale)       # 只改标量，α 参数继续可训练
 class InitialLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
