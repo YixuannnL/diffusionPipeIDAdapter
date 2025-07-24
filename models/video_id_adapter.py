@@ -36,11 +36,59 @@ class PositionalEncoding(nn.Module):
         pe = self.pe[:L].to(dtype=x.dtype, device=x.device)
         return x + pe
 
+from einops import rearrange
+from timm.layers import Mlp, DropPath
+
+class TemporalSelfAttention(nn.Module):
+    """(B, L, D) → (B, L, D)，仅在时间维做全局 self-attn，空间内用分组"""
+    def __init__(self, dim, num_heads, num_id_tokens: int, dropout: float = 0.):
+        super().__init__()
+        self.num_heads = num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+    # <<< 让 block 在构造时写入 num_id_tokens >>>
+        self.num_id_tokens = num_id_tokens
+
+    def forward(self, x, T):
+        """
+        Args:
+            x: (B, L_total, D)  (含 ID‑token)
+            T: 帧数
+        """
+        n_id = self.num_id_tokens     # 0 or 16
+
+        # id_tok, seq_tok = (x[:, :n_id, :], x[:, n_id:, :]) if n_id else (None, x)
+        if n_id:
+            id_tok, seq_tok = x[:, :n_id, :], x[:, n_id:, :]
+        else:
+            id_tok, seq_tok = None, x
+
+        B, L_seq, D = seq_tok.shape
+        N = L_seq // T               # token per frame
+        seq_tok = seq_tok.view(B * N, T, D)       # (B·N, T, D)
+        qkv = self.qkv(seq_tok).reshape(B * N, T, 3, self.num_heads, D // self.num_heads).permute(2, 0, 3, 1, 4)  # (3, B*N, H, T, d)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        seq_out = (attn @ v).transpose(1, 2).reshape(B * N, T, D)
+        seq_out = self.proj(seq_out)
+        seq_out = self.proj_drop(seq_out)
+        seq_out = seq_out.view(B, L_seq, D)
+        return torch.cat([id_tok, seq_out], dim=1) if n_id else seq_out
 
 class VideoIDAdapter(nn.Module):
     """
     时序 Transformer，把 Wan-VAE latent 序列 → N 个 ID-tokens
     """
+    # -----------------------------------------------------------
+    # VideoIDAdapter v2
+    # -----------------------------------------------------------
+    # ① 支持多尺度 / ROI 网格；② 引入“Temporal-Self-Attention (TSA)”
+    # ③ 输出端用 token-wise gating α_i，自动权衡各 ID-token 贡献
+    # -----------------------------------------------------------
 
     def __init__(
         self,
@@ -60,7 +108,9 @@ class VideoIDAdapter(nn.Module):
         self.num_id_tokens = num_id_tokens
         # ----- 控制采样策略 -----
         self.grid_h, self.grid_w = grid_size      # 默认 8 × 8 网格
-        self.pool_mode = pool_mode.lower()        # 可选 "grid" / "mean" / "center"
+        self.pool_mode = pool_mode.lower()                 # "grid" | ["grid","mean",...]
+        self.multi_scales: Tuple[int]=(8,4)          # extra grid sizes, e.g. (8,4)
+        
         # -----  
         self.hidden_size = hidden_size
         self.adapter_dim = adapter_dim
@@ -79,20 +129,27 @@ class VideoIDAdapter(nn.Module):
         # Position encoding（时空展平后一维绝对 PE）
         self.pos_enc = PositionalEncoding(adapter_dim)
 
-        # 标准 Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=adapter_dim,
-            nhead=num_heads,
-            dim_feedforward=adapter_dim * mlp_ratio,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        # ---------------- Transformer Encoder ----------------
+        blocks = []
+        for _ in range(num_layers):
+            blocks.append(nn.ModuleDict({
+                "tsa":       TemporalSelfAttention(adapter_dim, num_heads,
+                                                   num_id_tokens, dropout),
+                "mlp":       Mlp(adapter_dim, int(adapter_dim * mlp_ratio),
+                                 drop=dropout),
+                "norm1":     nn.LayerNorm(adapter_dim),
+                "norm2":     nn.LayerNorm(adapter_dim),
+                "drop_path": DropPath(dropout) if dropout > 0 else nn.Identity(),
+            }))
+        self.transformer = nn.ModuleList(blocks)
         
+        # gating α_i  （初始化为 0 ≈ 平均权重）
+        self.alpha = nn.Parameter(torch.zeros(num_id_tokens))
         self.out_proj = nn.Linear(adapter_dim, hidden_size, bias=True)
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+    def forward(self, 
+                latents: torch.Tensor,
+                ) -> torch.Tensor:
         """
         latents: [B, C, F, H, W] – Wan-VAE 输出 (未加噪)
         return id_tokens: [B, N, D]
@@ -101,7 +158,9 @@ class VideoIDAdapter(nn.Module):
         # ------------------------------------------------------------------
         # 先把 VAE latent 变成时序 token 序列  (B, seq_len, C)
         # ------------------------------------------------------------------
-        if self.pool_mode == "grid":
+        seqs = []
+        # 1. 主网格
+        if self.pool_mode == "grid" or isinstance(self.pool_mode, list) and "grid" in self.pool_mode:
             g_h, g_w = self.grid_h, self.grid_w
             # 在高、宽两个方向上取均匀网格中心的索引
             h_idx = torch.linspace(0, H - 1, g_h, device=latents.device).long()
@@ -110,38 +169,51 @@ class VideoIDAdapter(nn.Module):
                 latents.index_select(-2, h_idx)          # 选高度
                 .index_select(-1, w_idx)          # 选宽度
             )                                            # [B,C,F,g_h,g_w]
-            x = lat_sel.permute(0, 2, 3, 4, 1)           # [B,F,g_h,g_w,C]
-            x = x.reshape(B, F * g_h * g_w, C)           # 展平成序列
+            seqs.append(
+                rearrange(lat_sel, "b c f gh gw -> b (f gh gw) c")
+            )
+            
+            # 2. 可选多尺度
+            for g in self.multi_scales:
+                if g == self.grid_h: continue
+                h_idx = torch.linspace(0, H - 1, g, device=latents.device).long()
+                w_idx = torch.linspace(0, W - 1, g, device=latents.device).long()
+                sel = latents.index_select(-2, h_idx).index_select(-1, w_idx)
+                seqs.append(rearrange(sel, "b c f gh gw -> b (f gh gw) c"))
 
-        elif self.pool_mode == "mean":
+        elif self.pool_mode == "mean" or isinstance(self.pool_mode, list) and "mean" in self.pool_mode:
             # 对 H、W 做全局平均池化
             x = latents.mean(dim=(-2, -1))               # [B,C,F]
             x = x.permute(0, 2, 1)                      # [B,F,C]
 
-        elif self.pool_mode == "center":
+        elif self.pool_mode == "center" or isinstance(self.pool_mode, list) and "center" in self.pool_mode:
             # 直接取中心像素
             x = latents[..., H // 2, W // 2]             # [B,C,F]
             x = x.permute(0, 2, 1)                       # [B,F,C]
 
-        else:
-            raise ValueError(f"Unknown pool_mode '{self.pool_mode}'")
         # ------------------------------------------------------------------
         # 线性降维到 adapter_dim 并加绝对 PE
         # ------------------------------------------------------------------
-        x = self.in_proj(x)                         # [B, L, D] in_proj: C → adapter_dim
+        x = torch.cat(seqs, dim=1)                  # concat all sequences
+        x = self.in_proj(x)
         x = self.pos_enc(x)                         # 为序列中每个位置添加可微分的绝对正弦余弦位置信息，使 Transformer 能区分 token 在时间/空间序列上的先后
 
         # prepend learnable ID tokens
         id_tok = self.id_tokens.expand(B, -1, -1)   # [B, N, D]
         x = torch.cat([id_tok, x], dim=1)           # [B, N+L, D] 把它们“ prepend” 到时空 token 序列前面，让 Transformer 可以用后续的自注意力把时空信息汇聚到这些 ID token 上
 
-        x = self.transformer(x)                     # same shape
+        T = F                                        # 注意时间长度
+        for blk in self.transformer:
+            x = x + blk['drop_path'](blk['tsa'](blk['norm1'](x), T))
+            x = x + blk['drop_path'](blk['mlp'](blk['norm2'](x)))
         # ------------------------------------------------------------------
         # 取出前 N 个 ‑[ID]‑token → 投回 Wan hidden_size=5120
         # ------------------------------------------------------------------
-        out = x[:, :self.num_id_tokens, :]          # [B,N, adapter_dim] 取出经 Transformer 更新后的前 N 个 “身份” token
-
-        return self.out_proj(out)
+        id_feat = x[:, :self.num_id_tokens, :]      # [B,N,D]
+        # gating
+        w = torch.softmax(self.alpha, dim=0)        # (N,)
+        pooled = (w.unsqueeze(0).unsqueeze(-1) * id_feat).sum(1)   # [B,D]
+        return self.out_proj(pooled).unsqueeze(1)   # [B,1,hidden]
 
     # output projection weights（trainable）
     # out_proj_weight: torch.Tensor

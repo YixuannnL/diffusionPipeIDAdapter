@@ -298,16 +298,18 @@ class WanAttentionBlock(nn.Module):
                                                                       qk_norm,
                                                                       eps)
         
-        # 专用 cross-attn for ID-tokens
+        # ---------- 双通路 cross-attention ----------
         self.use_id_tokens = use_id_tokens # self.use_id_tokens 的默认值是 False；只有在显式指定要加IDToken的那几层时才会被改成 True
         if self.use_id_tokens:
             self.id_cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
                 dim, num_heads, (-1, -1), qk_norm, eps
             )
             self.alpha_id = nn.Parameter(torch.full((dim,), 1e-3))
+            self.alpha_txt = nn.Parameter(torch.full((dim,), 1e-3))
         else:
             self.id_cross_attn = None
             self.alpha_id      = None
+            self.alpha_txt     = None
         
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
@@ -361,7 +363,10 @@ class WanAttentionBlock(nn.Module):
             if self.id_cross_attn is not None and id_tokens is not None:
                 y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens).to(work_dtype)
                 alpha = (self.alpha_scale.to(work_dtype) * self.alpha_id.to(work_dtype))
-                x = x_work + y_txt + alpha * y_id
+                # softmax(α_txt, α_id) 做归一化
+                alpha_txt = self.alpha_scale.to(work_dtype) * self.alpha_txt.to(work_dtype)
+                w_txt, w_id = torch.softmax(torch.stack([alpha_txt, alpha]), dim=0)
+                x = x_work + w_txt * y_txt + w_id * y_id
             else:
                 x = x_work + y_txt
 
@@ -600,13 +605,14 @@ class WanPipeline(BasePipeline):
             if getattr(blk, "alpha_id", None) is None:
                 mean_val = blk.cross_attn.o.weight.float().mean().to(self.model_config["dtype"])
                 blk.alpha_id = torch.nn.Parameter(mean_val.expand(blk.dim).clone(), requires_grad=True)
-                # blk.alpha_id = torch.nn.Parameter(
-                #     torch.full((blk.dim,), 1e-3, dtype=self.model_config["dtype"]),
-                #     requires_grad=True,
-                # )
                 blk.alpha_id.original_name = f"blocks.{idx}.alpha_id"
                 # 注册梯度放大 hook：所有 alpha_id 的 grad ×10
                 blk.alpha_id.register_hook(lambda g: g * 10.0)
+                
+                blk.alpha_txt = torch.nn.Parameter(mean_val.expand(blk.dim).clone(), requires_grad=True)
+                blk.alpha_txt.original_name = f"blocks.{idx}.alpha_txt"
+                blk.alpha_txt.register_hook(lambda g: g * 10.0)
+                              
                 # warm‑up 乘法标量，初始化为 0（常量，不参与梯度）
                 blk.register_buffer(
                     "alpha_scale",
