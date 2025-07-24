@@ -9,7 +9,7 @@ keep_vae_gpu = true                                   # 避免频繁 CPU↔GPU �
 # Video‑ID adapter（权重文件含 adapter + id_cross_attn 权重）
 [adapter]
 type              = "video_id"
-ckpt_path           = "/data/bohong/diffusion-pipe/data/output/20250718_04-51-51/epoch15/video_id_adapter.safetensors"
+ckpt_path           = "/data/bohong/diffusion-pipe/data/output/20250723_14-29-35/epoch2/video_id_adapter.safetensors"
 num_id_tokens     = 16
 adapter_dim       = 2048
 num_layers        = 4
@@ -18,6 +18,8 @@ mlp_ratio         = 4
 dropout           = 0.0
 layers            = [12, 15, 18, 21]                  # 与训练保持一致
 dtype             = "bfloat16"                        # adapter 参数 dtype
+grid_size      = [8, 8] # 可以调得更密一点
+pool_mode      = "grid" # 或 "mean" / "center"
 
 # 默认生成设置，可被 CLI 参数覆盖
 [generation]

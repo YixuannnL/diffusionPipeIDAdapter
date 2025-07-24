@@ -571,7 +571,7 @@ class WanPipeline(BasePipeline):
             mlp_ratio         = adapter_config.get('mlp_ratio', 4),
             dropout           = adapter_config.get('dropout', 0.0),
             proj_in_channels  = latent_ch,
-            grid_size         = (adapter_config.get('grid_size', 8)[0], adapter_config.get('grid_size', 8)[1]),
+            grid_size         = (adapter_config.get('grid_size', [8, 8])[0], adapter_config.get('grid_size', [8, 8])[1]),
             pool_mode         = adapter_config.get('pool_mode', "grid"),
         ).to(self.model_config['dtype'])
 
@@ -672,16 +672,16 @@ class WanPipeline(BasePipeline):
         # ------------------------------------------------------------------
         #  LayerNorm γ / β 解冻
         # ------------------------------------------------------------------
-        for m in self.transformer.modules():
-            if isinstance(m, torch.nn.LayerNorm) and m.elementwise_affine:
-                m.weight.requires_grad_(True)
-                if m.bias is not None:
-                    m.bias.requires_grad_(True)
-                # 打 name
-                for n, p in m.named_parameters(recurse=False):
-                    p.original_name = (
-                        f"blocks_layernorm.{id(m)}.{n}"  # 唯一即可
-                    )
+        for blk_idx, blk in enumerate(self.transformer.blocks):
+            for attr in ("norm1", "norm2", "norm3"):
+                ln = getattr(blk, attr, None)
+                if isinstance(ln, torch.nn.LayerNorm) and ln.elementwise_affine:
+                    ln.weight.requires_grad_(True)
+                    if ln.bias is not None:
+                        ln.bias.requires_grad_(True)
+                    for n, p in ln.named_parameters(recurse=False):
+                        # e.g.  blocks.12.norm1.weight
+                        p.original_name = f"blocks.{blk_idx}.{attr}.{n}"
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
@@ -703,6 +703,25 @@ class WanPipeline(BasePipeline):
         ③ 加载权重
         """
         sd = load_file(weights_file, device='cpu')
+        
+        # ───────────── 修复 LoRA 键名 ─────────────
+        import re
+
+        def _fix_lora_key(k: str) -> str:
+            """把训练阶段存储时被 `_` 扁平化的 LoRA 参数名还原成带 `.` 的真实层级名"""
+            if not k.startswith("blocks.") or "_lora_" not in k:
+                # 非 LoRA / 非 blocks 开头的不需要动
+                return k
+            # model_ → model.
+            k = k.replace("model_", "model.")
+            # *_lora_[A|B|E]_* → *.lora_[A|B|E].*
+            k = re.sub(r"_lora_([ABEinE])_", r".lora_\1.", k)
+            # 末尾 _weight / _bias → .weight / .bias
+            k = re.sub(r"_weight$", ".weight", k)
+            k = re.sub(r"_bias$",   ".bias",   k)
+            return k
+
+        sd = {_fix_lora_key(k): v for k, v in sd.items()}
         
         # ---------- 1.  若 adapter 不存在 → 根据 state_dict 推断并创建 ----------
         if getattr(self, "video_id_adapter", None) is None:

@@ -135,12 +135,31 @@ def build_model(cfg: dict, device: torch.device, dtype: torch.dtype, compile_gra
     from safetensors.torch import load_file
     full_sd = load_file(adapter_ckpt, device='cpu')
     
+    # ───────────── 修复 LoRA 键名 ─────────────
+    import re
+
+    def _fix_lora_key(k: str) -> str:
+        """把训练阶段存储时被 `_` 扁平化的 LoRA 参数名还原成带 `.` 的真实层级名"""
+        if not k.startswith("blocks.") or "_lora_" not in k:
+            # 非 LoRA / 非 blocks 开头的不需要动
+            return k
+        # model_ → model.
+        k = k.replace("model_", "model.")
+        # *_lora_[A|B|E]_* → *.lora_[A|B|E].*
+        k = re.sub(r"_lora_([ABEinE])_", r".lora_\1.", k)
+        # 末尾 _weight / _bias → .weight / .bias
+        k = re.sub(r"_weight$", ".weight", k)
+        k = re.sub(r"_bias$",   ".bias",   k)
+        return k
+
+    full_sd = {_fix_lora_key(k): v for k, v in full_sd.items()}
+    
     # A  把 blocks.* 权重先尝试补进 transformer
     xattn_sd = {k: v for k, v in full_sd.items() if k.startswith("blocks.")}
     if xattn_sd:
         incomp, unexp = pipe.transformer.load_state_dict(xattn_sd, strict=False)
         print(f"unexpected={len(unexp)}")
-        
+    import pdb; pdb.set_trace()
     # B  再让适配器本体去加载自己那部分
     load_fn = (
         getattr(pipe, "load_video_id_adapter_weights", None)
@@ -200,8 +219,17 @@ def generate_video(
             extra_kwargs["first_frame"] = ref_vid[0]
             extra_kwargs["last_frame"]  = ref_vid[-1]
 
-        size_str  = cfg.get("size", "720*480")
-        size_tuple = wan_cfgs.SIZE_CONFIGS.get(size_str, wan_cfgs.SIZE_CONFIGS["720*480"])
+        # Wan 的 size 配置
+        # SIZE_CONFIGS = {
+        #     '720*1280': (720, 1280),
+        #     '1280*720': (1280, 720),
+        #     '480*832': (480, 832),
+        #     '832*480': (832, 480),
+        #     '1024*1024': (1024, 1024),
+        # }
+
+        size_str  = cfg.get("size", "832*480")
+        size_tuple = wan_cfgs.SIZE_CONFIGS.get(size_str, wan_cfgs.SIZE_CONFIGS["832*480"])
         max_area   = wan_cfgs.MAX_AREA_CONFIGS[size_str]
 
         common = dict(frame_num=num_frames,
