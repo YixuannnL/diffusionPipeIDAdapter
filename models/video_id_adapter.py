@@ -9,10 +9,10 @@ class PositionalEncoding(nn.Module):
     Sinusoidal PE，遇到更长序列时自动扩展，不再固定 262 144。
     内部缓存总在 CPU / fp32，前向时按需 to(device, dtype)。
     """
-    def __init__(self, dim, init_len: int = 262_144):
+    def __init__(self, dim, init_len: int = 1024):
         super().__init__()
         self.dim = dim
-        self.register_buffer("pe", self._build(1024), persistent=False)
+        self.register_buffer("pe", self._build(init_len), persistent=False)
 
     def _build(self, length: int) -> torch.Tensor:
         position = torch.arange(length, dtype=torch.float32).unsqueeze(1)      # [L,1]
@@ -234,15 +234,3 @@ class VideoIDAdapter(nn.Module):
 
         # ---------- 3. 把加权后的 N 个 token 直接返回 ----------
         return proj_out
-     
-
-    # output projection weights（trainable）
-    # out_proj_weight: torch.Tensor
-    # out_proj_bias:   torch.Tensor
-    def _init_output_proj(self, hidden_size, adapter_dim):
-        self.out_proj_weight = nn.Parameter(torch.empty(hidden_size, adapter_dim))
-        self.out_proj_bias   = nn.Parameter(torch.zeros(hidden_size))               
-        nn.init.kaiming_uniform_(self.out_proj_weight, a=math.sqrt(5))
-
-    def __post_init__(self):
-        self._init_output_proj(self.hidden_size, self.adapter_dim)

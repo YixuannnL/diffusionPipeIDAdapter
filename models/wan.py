@@ -362,10 +362,9 @@ class WanAttentionBlock(nn.Module):
             # id-token cross-attn
             if self.id_cross_attn is not None and id_tokens is not None:
                 y_id = self.id_cross_attn(self.norm3(x), id_tokens, id_lens).to(work_dtype)
-                alpha = (self.alpha_scale.to(work_dtype) * self.alpha_id.to(work_dtype))
-                # softmax(α_txt, α_id) 做归一化
-                alpha_txt = self.alpha_scale.to(work_dtype) * self.alpha_txt.to(work_dtype)
-                w_txt, w_id = torch.softmax(torch.stack([alpha_txt, alpha]), dim=0)
+                score_txt = (self.alpha_scale * self.alpha_txt).mean()   # → scalar
+                score_id  = (self.alpha_scale * self.alpha_id ).mean()
+                w_txt, w_id = torch.softmax(torch.stack([score_txt, score_id]), dim=0)
                 x = x_work + w_txt * y_txt + w_id * y_id
             else:
                 x = x_work + y_txt
@@ -773,15 +772,28 @@ class WanPipeline(BasePipeline):
         )
         for idx in inject_blocks:
             blk = self.transformer.blocks[idx]
+            # --- id_cross_attn ---
             if not hasattr(blk, "id_cross_attn"):
                 cross_cls = blk.cross_attn.__class__
                 blk.id_cross_attn = cross_cls(
                     blk.dim, blk.num_heads, (-1,-1),
-                    # blk.qk_norm, 
-                    # blk.eps
                     getattr(blk.cross_attn, "model", blk.cross_attn).qk_norm,
                     getattr(blk.cross_attn, "model", blk.cross_attn).eps,
                 ).to(dtype=self.model_config["dtype"], device='cuda')
+                
+            # --- alpha_id / alpha_txt / alpha_scale ---
+            if not hasattr(blk, "alpha_id"):
+                mean_val = blk.cross_attn.o.weight.float().mean().to(self.model_config["dtype"])
+                blk.alpha_id  = torch.nn.Parameter(mean_val.expand(blk.dim).clone(), requires_grad=True)
+                blk.alpha_txt = torch.nn.Parameter(mean_val.expand(blk.dim).clone(), requires_grad=True)
+                blk.register_buffer(
+                    "alpha_scale",
+                    torch.zeros(1, dtype=self.model_config["dtype"]),
+                    persistent=False,
+                )
+                # 训练时放大学习率
+                blk.alpha_id.register_hook(lambda g: g * 10.0)
+                blk.alpha_txt.register_hook(lambda g: g * 10.0)
                 
         # ---------- 3.  load weights ----------
         # 3.1 adapter
