@@ -1,10 +1,13 @@
 from pathlib import Path
 import re
+from typing import Tuple, Dict, List
 
+import json 
 import peft
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 import safetensors.torch
 import torchvision
 from PIL import Image, ImageOps
@@ -18,26 +21,25 @@ def make_contiguous(*tensors):
     return tuple(x.contiguous() for x in tensors)
 
 
-def extract_clips(video, target_frames, video_clip_mode):
+def extract_clips(video, face_video, target_frames, video_clip_mode):
     # video is (channels, num_frames, height, width)
     frames = video.shape[1]
     if frames < target_frames:
         # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
         print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
         return []
-
     if video_clip_mode == 'single_beginning':
-        return [video[:, :target_frames, ...]]
+        return [video[:, :target_frames, ...]], [face_video[:, :target_frames, ...]] if face_video is not None else None
     elif video_clip_mode == 'single_middle':
         start = int((frames - target_frames) / 2)
         assert frames-start >= target_frames
-        return [video[:, start:start+target_frames, ...]]
+        return [video[:, start:start+target_frames, ...]], [face_video[:, start:start+target_frames, ...]] if face_video is not None else None
     elif video_clip_mode == 'multiple_overlapping':
         # Extract multiple clips so we use the whole video for training.
         # The clips might overlap a little bit. We never cut anything off the end of the video.
         num_clips = ((frames - 1) // target_frames) + 1
         start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
-        return [video[:, i:i+target_frames, ...] for i in start_indices]
+        return [video[:, i:i+target_frames, ...] for i in start_indices], [face_video[:, i:i+target_frames, ...] for i in start_indices] if face_video is not None else None    
     else:
         raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
 
@@ -56,6 +58,24 @@ def convert_crop_and_resize(pil_img, width_and_height):
 
     return ImageOps.fit(pil_img, width_and_height)
 
+def letterbox_to(tgt_w: int, tgt_h: int, img: Image.Image) -> Image.Image:
+    """保持宽高比缩放，再黑边 pad 到 (tgt_h, tgt_w)"""
+    orig_w, orig_h = img.size
+    scale = min(tgt_w / orig_w, tgt_h / orig_h)   # 等比缩小/放大因子
+    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+    resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    # 计算左右 / 上下 pad
+    pad_w = tgt_w - new_w
+    pad_h = tgt_h - new_h
+    left   = pad_w // 2
+    right  = pad_w - left
+    top    = pad_h // 2
+    bottom = pad_h - top
+
+    padded = TF.pad(resized, padding=[left, top, right, bottom], fill=0)
+    return padded
+
 
 class PreprocessMediaFile:
     def __init__(self, config, support_video=False, framerate=None, round_height=1, round_width=1, round_frames=1):
@@ -72,7 +92,7 @@ class PreprocessMediaFile:
         if self.support_video:
             assert self.framerate
 
-    def __call__(self, filepath, mask_filepath, size_bucket=None):
+    def __call__(self, filepath, mask_filepath, bbox_filepath,size_bucket=None):
         is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
         if is_video:
             assert self.support_video
@@ -112,23 +132,72 @@ class PreprocessMediaFile:
         else:
             mask = None
 
+        # 若同目录存在同名 bbox.json，就读取人脸框；否则None
+        Box = Tuple[float, float, float, float]        # (x1, y1, x2, y2)
+        FrameBoxes = Dict[int, List[Box]]              # {frame_idx: [box, ...]}
+        if bbox_filepath:
+            bbox_data = json.load(open(bbox_filepath))
+            frame_boxes: FrameBoxes = {}    
+            for frame_idx, content in sorted(bbox_data.items(), key=lambda x: int(x[0])):
+                frame_idx = int(frame_idx)
+                faces = content.get("face", [])
+                boxes: List[Box] = [
+                    (
+                        face["box"]["x1"],
+                        face["box"]["y1"],
+                        face["box"]["x2"],
+                        face["box"]["y2"]
+                    )
+                    for face in faces
+                ]
+                frame_boxes[frame_idx] = boxes
+        else:
+            frame_boxes = None
+
         resized_video = torch.empty((num_frames, 3, height_rounded, width_rounded))
+        face_frames = []
         for i, frame in enumerate(video):
             if not isinstance(frame, Image.Image):
                 frame = torchvision.transforms.functional.to_pil_image(frame)
+                
+            need_face_crop = (
+                frame_boxes is not None and
+                len(frame_boxes[i]) == 1 or 0
+            )
+                 
+            if not need_face_crop:
+                face_frames.append(self.pil_to_tensor(convert_crop_and_resize(frame, resize_wh)))
+            else:               
+                if len(frame_boxes[i]) == 0: # 有可能某一帧检测不到面部
+                    crop_resize_face_dummy = convert_crop_and_resize(frame, resize_wh)
+                    face_frames.append(self.pil_to_tensor(crop_resize_face_dummy))
+                else:
+                    tgt_w, tgt_h = resize_wh
+                    x1, y1, x2, y2 = frame_boxes[i][0]
+                    crop_face = frame.crop((x1, y1, x2, y2))
+                    crop_resize_face = letterbox_to(tgt_w, tgt_h, crop_face)
+                    face_frames.append(self.pil_to_tensor(crop_resize_face)) 
             cropped_image = convert_crop_and_resize(frame, resize_wh)
-            resized_video[i, ...] = self.pil_to_tensor(cropped_image)
+            resized_video[i] = self.pil_to_tensor(cropped_image)
+
+        if face_frames is not None:
+            face_frames = torch.stack(face_frames)
 
         if not self.support_video:
-            return [(resized_video.squeeze(0), mask)]
+            return [(resized_video.squeeze(0), mask, None)]
 
         # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
         resized_video = torch.permute(resized_video, (1, 0, 2, 3))
+        if face_frames is not None:
+            face_frames = torch.permute(face_frames, (1, 0, 2, 3))
         if not is_video:
-            return [(resized_video, mask)]
+            return [(resized_video, mask, face_frames)]
         else:
-            videos = extract_clips(resized_video, frames_rounded, self.video_clip_mode)
-            return [(video, mask) for video in videos]
+            videos, face_videos = extract_clips(resized_video, face_frames, frames_rounded, self.video_clip_mode)
+            if face_videos is not None:
+                return [(video, mask) for video in videos], [(face_video, mask) for face_video in face_videos]
+            else:
+                return [(video, mask) for video in videos], None
 
 
 class BasePipeline:

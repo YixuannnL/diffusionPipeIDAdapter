@@ -860,20 +860,19 @@ class WanPipeline(BasePipeline):
         def fn(tensor):
             vae = vae_and_clip.vae
             p = next(vae.parameters())
-            tensor = tensor.to(p.device, p.dtype)           
-            latents = vae_encode(tensor, self.vae)
-            ret = {'latents': latents}
+            latents = tensor[0].to(p.device, p.dtype) 
+            face_latents = tensor[1].to(p.device, p.dtype) 
+            latents = vae_encode(latents, self.vae)
+            face_latents = vae_encode(face_latents, self.vae)
+            ret = {'latents': latents, 'face_latents': face_latents}
 
             # ====== Face-ID branch ======
             if self.face_encoder is not None:
+                face_tensor = tensor[1]
                 # 取首帧，范围保持 [-1,1]
-                first = tensor[:, :, 0, ...]                 # (B,C,H,W)
-                # InsightFace 推荐 112×112；这里 224×224 精度更好
-                first_resized = torch.nn.functional.interpolate(
-                    first, size=(224,224), mode='bilinear', align_corners=False
-                )
+                first = face_tensor[:, :, 0, ...].squeeze()                 # (C,H,W)
                 with torch.no_grad():
-                    emb = self.face_encoder(first_resized)   # (B,512), 已经 L2-norm
+                    emb = self.face_encoder(first)   # (B,512), 已经 L2-norm
                 ret['face_emb'] = emb.to('cpu')              # 存 CPU，方便写 Arrow
             # ==================================
             clip = vae_and_clip.clip
@@ -913,8 +912,9 @@ class WanPipeline(BasePipeline):
                 return {'text_embeddings': text_embeddings, 'seq_lens': seq_lens}
         return fn
 
-    def prepare_inputs(self, inputs, timestep_quantile=None):      
+    def prepare_inputs(self, inputs, timestep_quantile=None):   
         latents = inputs['latents'].float()
+        face_latents = inputs.get('face_latents', None)
         # TODO: why does text_embeddings become float32 here? It's bfloat16 coming out of the text encoder.
         text_embeddings = inputs['text_embeddings']
         seq_lens = inputs['seq_lens']
@@ -966,7 +966,8 @@ class WanPipeline(BasePipeline):
         # -------- Video-ID Adapter --------
         if self.video_id_adapter is not None:
             adap_dev = next(self.video_id_adapter.parameters()).device
-            latents_for_adp = latents.to(adap_dev, dtype=self.model_config["dtype"])
+            src_lat = face_latents if face_latents is not None else latents
+            latents_for_adp = src_lat.to(adap_dev, dtype=self.model_config["dtype"])
             with torch.autocast(device_type=adap_dev.type,
                                 dtype=self.model_config["dtype"]):
                 id_tokens = self.video_id_adapter(latents_for_adp)   # [B,N,D]
@@ -977,7 +978,7 @@ class WanPipeline(BasePipeline):
         return (
             # (x_t, y, t, text_embeddings, seq_lens, clip_context),
             (x_t, y, t, text_embeddings, seq_lens, clip_context, id_tokens, id_lens, face_emb),
-            (target, mask, face_emb, x_t.detach(), t.detach()),
+            (target, mask, face_latents, face_emb, x_t.detach(), t.detach()),
         )
 
     def to_layers(self):
@@ -1042,7 +1043,7 @@ class WanPipeline(BasePipeline):
             return       : scalar loss
             """
             # ----------- 1. 解析 label -----------
-            target, mask, ref_face, x_t, t = label
+            target, mask, face_latents, face_emb, x_t, t = label
             target = target.to(model_output.dtype)
 
             # ----------- 2. 扩散 MSE/V-pred 损失 -----------   
@@ -1056,8 +1057,8 @@ class WanPipeline(BasePipeline):
             # ----------- 3. Face-ID 损失 -----------
             if (
                 (self.face_encoder is not None) and        # 已启用人脸 Encoder
-                (ref_face is not None) and                 # 数据里带 ref 向量
-                ref_face.abs().sum() > 0                   # 不是全 0（= 未检出脸）
+                (face_emb is not None) and                 # 数据里带 ref 向量
+                face_emb.abs().sum() > 0                   # 不是全 0（= 未检出脸）
             ):
                 t_exp = (t / 1000).view(-1, 1, 1, 1, 1).to(model_output.dtype)
                 x1_pred = x_t.to(model_output.dtype) - t_exp * model_output
@@ -1080,8 +1081,8 @@ class WanPipeline(BasePipeline):
                 ).float()                        # ID 向量统一 float32
 
                 # (d) cosine 相似度 → loss
-                ref_face = ref_face.to(emb_pred.device, dtype=emb_pred.dtype)
-                cos_sim  = torch.sum(emb_pred * ref_face, dim=1)    # (B,)
+                face_emb = face_emb.to(emb_pred.device, dtype=emb_pred.dtype)
+                cos_sim  = torch.sum(emb_pred * face_emb, dim=1)    # (B,)
                 id_loss  = (1 - cos_sim).mean().to(model_output.dtype)
 
                 # (e) 逐步放大权重

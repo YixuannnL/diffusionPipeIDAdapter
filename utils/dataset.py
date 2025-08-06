@@ -6,6 +6,7 @@ import math
 import os
 import hashlib
 import json
+import re
 import cv2
 
 import numpy as np
@@ -291,6 +292,7 @@ class DirectoryDataset:
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
+        self.bbox_path = Path(self.directory_config['bbox_path']) if 'bbox_path' in self.directory_config else None
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
@@ -299,6 +301,8 @@ class DirectoryDataset:
             raise RuntimeError(f'Invalid path: {self.path}')
         if self.mask_path is not None and (not self.mask_path.exists() or not self.mask_path.is_dir()):
             raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
+        if self.bbox_path is not None and (not self.bbox_path.exists() or not self.bbox_path.is_dir()):
+            raise RuntimeError(f'Invalid bbox_path: {self.bbox_path}')
         if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
             raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
@@ -337,10 +341,11 @@ class DirectoryDataset:
 
         # Mask can have any extension, it just needs to have the same stem as the image.
         mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
-
+        bbox_file_stems = {path.stem: path for path in self.bbox_path.glob('*') if path.is_file()} if self.bbox_path is not None else {}
         image_files = []
         caption_files = []
         mask_files = []
+        bbox_files = []
         for file in files:
             if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz' or file.suffix == '.json':
                 continue
@@ -358,9 +363,14 @@ class DirectoryDataset:
                 if self.mask_path is not None:
                     logger.warning(f'No mask file was found for image {image_file}, not using mask.')
                 mask_files.append(None)
+                
+            if image_file.stem in bbox_file_stems:
+                bbox_files.append(str(bbox_file_stems[image_file.stem]))
+            else:
+                bbox_files.append(None)
         assert len(image_files) > 0, f'Directory {self.path} had no images/videos!'
 
-        metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files, 'mask_file': mask_files})
+        metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files, 'mask_file': mask_files, 'bbox_file': bbox_files})
         # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
         # Seed is based on the hash of the directory path, so that if directories have the same set of images, they are shuffled differently.
         seed = int(hashlib.md5(str.encode(str(self.path))).hexdigest(), 16) % int(1e9)
@@ -449,7 +459,7 @@ class DirectoryDataset:
             if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
                 self.shuffle = 1
             captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
-            empty_return = {'image_file': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
+            empty_return = {'image_file': [], 'mask_file': [], 'bbox_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
 
             image_file = Path(image_file)
             if image_file.suffix == '.webp':
@@ -499,7 +509,8 @@ class DirectoryDataset:
                 'caption': [captions],
                 'ar_bucket': [ar_bucket],
                 'size_bucket': [size_bucket],
-                'is_video': [is_video]
+                'is_video': [is_video],
+                'bbox_file': [example['bbox_file'][0]]
             }
 
         return fn
@@ -669,7 +680,9 @@ class Dataset:
         ret = {}
         for key, value in examples[0].items():
             if key == 'mask':
-                continue  # mask is handled specially below
+                continue  # mask is handled specially below 
+            if key == 'bbox_file':
+                continue  # bbox_file is handled specially below
             if torch.is_tensor(value):
                 ret[key] = torch.stack([example[key] for example in examples])
             else:
@@ -693,6 +706,9 @@ class Dataset:
         else:
             # We can leave the batch mask as None and the loss_fn will skip masking entirely.
             ret['mask'] = None
+            
+            
+        
         return ret
 
     def cache_metadata(self, regenerate_cache=False):
@@ -724,28 +740,37 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
     def latents_map_fn(example):
         first_size_bucket = example['size_bucket'][0]
         tensors_and_masks = []
+        face_tensors_and_masks = []
         image_files = []
         captions = []
-        for path, mask_path, size_bucket, caption in zip(example['image_file'], example['mask_file'], example['size_bucket'], example['caption']):
+
+        for path, mask_path, bbox_path, size_bucket, caption in zip(example['image_file'], example['mask_file'], example['bbox_file'], example['size_bucket'], example['caption']):
             assert size_bucket == first_size_bucket
-            items = preprocess_media_file_fn(path, mask_path, size_bucket)
+            items, face_items = preprocess_media_file_fn(path, mask_path, bbox_path, size_bucket) # 其中每个item是一个tuple，(tensor, mask)
             tensors_and_masks.extend(items)
+            face_tensors_and_masks.extend(face_items)
             image_files.extend([path] * len(items))
             captions.extend([caption] * len(items))
-
         if len(tensors_and_masks) == 0:
-            return {'latents': [], 'mask': [], 'image_file': [], 'caption': []}
+            return {'latents': [], 'mask': [], 'image_file': [], 'caption': [], 'faces': []}
 
         caching_batch_size = len(example['image_file'])
         results = defaultdict(list)
+        
+        # 将tensors_and_masks按caching_batch_size分组，每组中tensors_and_masks的shape相同
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensors = [t[0] for t in tensors_and_masks[i:i+caching_batch_size]]
+            face_tensors = [t[0] for t in face_tensors_and_masks[i:i+caching_batch_size]]
             batched = torch.stack(tensors)
+            batched_face = torch.stack(face_tensors)
+            both_batched = [batched, batched_face]
             parent_conn, child_conn = mp.Pipe(duplex=False)
-            queue.put((0, batched, child_conn))
+            queue.put((0, both_batched, child_conn))
             result = parent_conn.recv()  # dict
+                  
             for k, v in result.items():
                 results[k].append(v)
+                                
         # concatenate the list of tensors at each key into one batched tensor
         for k, v in results.items():
             results[k] = torch.cat(v)
@@ -861,7 +886,7 @@ class DatasetManager:
                     submodel.to('cpu')
             self.submodels[id].to('cuda')
         if id == 0:
-            tensor, pipe = task[1:]
+            tensor, pipe = task[1:] # tansor = [latents, faces_latents]
             results = self.call_vae_fn(tensor)
         elif id > 0:
             caption, is_video, pipe = task[1:]
@@ -976,15 +1001,14 @@ class PipelineDataLoader:
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
-            target, mask, face_emb, x_t, t = label
+            target, mask, face_latents, face_emb, x_t, t = label
             # The target depends on the noise, so we must broadcast it from the first stage to the last.
             # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
             # would line up on the first and last stage so that this doesn't deadlock.
             target = self._broadcast_target(target)
-            if face_emb is not None:
-                label = (target, mask, face_emb, x_t, t)
-            else:
-                label = (target, mask)
+
+            label = (target, mask, face_latents, face_emb, x_t, t)
+
             self.num_batches_pulled += 1
             for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
                 yield micro_batch
