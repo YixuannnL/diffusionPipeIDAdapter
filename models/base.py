@@ -93,20 +93,24 @@ class PreprocessMediaFile:
             assert self.framerate
 
     def __call__(self, filepath, mask_filepath, bbox_filepath,size_bucket=None):
+        
+        # ---------- 0. 打开图像 / 视频 ---------- #
         is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
         if is_video:
             assert self.support_video
-            num_frames = 0
-            for frame in imageio.v3.imiter(filepath, fps=self.framerate):
-                num_frames += 1
-                height, width = frame.shape[:2]
-            video = imageio.v3.imiter(filepath, fps=self.framerate)
+            video = [
+                Image.fromarray(f)
+                for f in imageio.v3.imiter(filepath, fps=self.framerate)
+            ]
+            num_frames = len(video)
+            height, width = video[0].height, video[0].width
         else:
-            num_frames = 1
             pil_img = Image.open(filepath)
             height, width = pil_img.height, pil_img.width
+            num_frames = 1
             video = [pil_img]
 
+        # ---------- 1. 目标分辨率 ---------- #
         if size_bucket is not None:
             size_bucket_width, size_bucket_height, size_bucket_frames = size_bucket
         else:
@@ -117,6 +121,7 @@ class PreprocessMediaFile:
         frames_rounded = round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
         resize_wh = (width_rounded, height_rounded)
 
+        # ---------- 2. mask ---------- #
         if mask_filepath:
             mask_img = Image.open(mask_filepath).convert('RGB')
             img_hw = (height, width)
@@ -132,72 +137,63 @@ class PreprocessMediaFile:
         else:
             mask = None
 
-        # 若同目录存在同名 bbox.json，就读取人脸框；否则None
-        Box = Tuple[float, float, float, float]        # (x1, y1, x2, y2)
-        FrameBoxes = Dict[int, List[Box]]              # {frame_idx: [box, ...]}
-        if bbox_filepath:
-            bbox_data = json.load(open(bbox_filepath))
-            frame_boxes: FrameBoxes = {}    
-            for frame_idx, content in sorted(bbox_data.items(), key=lambda x: int(x[0])):
-                frame_idx = int(frame_idx)
-                faces = content.get("face", [])
-                boxes: List[Box] = [
-                    (
-                        face["box"]["x1"],
-                        face["box"]["y1"],
-                        face["box"]["x2"],
-                        face["box"]["y2"]
-                    )
-                    for face in faces
+        # ---------- 3. bbox ---------- #
+        frame_boxes: dict[int, list[tuple[float, float, float, float]]] | None = None
+        if bbox_filepath and Path(bbox_filepath).exists():
+            with open(bbox_filepath, 'r') as f:
+                raw = json.load(f)
+            frame_boxes = {
+                int(k): [
+                    (face["box"]["x1"], face["box"]["y1"],
+                     face["box"]["x2"], face["box"]["y2"])
+                    for face in v.get("face", [])
                 ]
-                frame_boxes[frame_idx] = boxes
-        else:
-            frame_boxes = None
+                for k, v in raw.items()
+            }
 
-        resized_video = torch.empty((num_frames, 3, height_rounded, width_rounded))
-        face_frames = []
-        for i, frame in enumerate(video):
+        # ---------- 4. 遍历帧，生成视频张量 & face 张量 ---------- #
+        video_tensor = torch.empty((num_frames, 3, height_rounded, width_rounded))
+        face_frames: list[torch.Tensor] = []
+        
+        for idx, frame in enumerate(video):
             if not isinstance(frame, Image.Image):
                 frame = torchvision.transforms.functional.to_pil_image(frame)
                 
-            need_face_crop = (
-                frame_boxes is not None and
-                len(frame_boxes[i]) == 1 or 0
-            )
-                 
-            if not need_face_crop:
-                face_frames.append(self.pil_to_tensor(convert_crop_and_resize(frame, resize_wh)))
-            else:               
-                if len(frame_boxes[i]) == 0: # 有可能某一帧检测不到面部
-                    crop_resize_face_dummy = convert_crop_and_resize(frame, resize_wh)
-                    face_frames.append(self.pil_to_tensor(crop_resize_face_dummy))
-                else:
-                    tgt_w, tgt_h = resize_wh
-                    x1, y1, x2, y2 = frame_boxes[i][0]
-                    crop_face = frame.crop((x1, y1, x2, y2))
-                    crop_resize_face = letterbox_to(tgt_w, tgt_h, crop_face)
-                    face_frames.append(self.pil_to_tensor(crop_resize_face)) 
-            cropped_image = convert_crop_and_resize(frame, resize_wh)
-            resized_video[i] = self.pil_to_tensor(cropped_image)
-
-        if face_frames is not None:
-            face_frames = torch.stack(face_frames)
-
-        if not self.support_video:
-            return [(resized_video.squeeze(0), mask, None)]
-
-        # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
-        resized_video = torch.permute(resized_video, (1, 0, 2, 3))
-        if face_frames is not None:
-            face_frames = torch.permute(face_frames, (1, 0, 2, 3))
-        if not is_video:
-            return [(resized_video, mask, face_frames)]
-        else:
-            videos, face_videos = extract_clips(resized_video, face_frames, frames_rounded, self.video_clip_mode)
-            if face_videos is not None:
-                return [(video, mask) for video in videos], [(face_video, mask) for face_video in face_videos]
+            # a) always resize整帧
+            video_tensor[idx] = self.pil_to_tensor(convert_crop_and_resize(frame, resize_wh))
+            
+            # b) 尝试裁脸
+            boxes = frame_boxes.get(idx, []) if frame_boxes else []  
+            if len(boxes) == 1:
+                x1, y1, x2, y2 = boxes[0]
+                crop = frame.crop((x1, y1, x2, y2))
             else:
-                return [(video, mask) for video in videos], None
+                crop = frame 
+            if idx == 0:
+                crop.save(f'process_img/crop_{idx}_{bbox_filepath}.png')
+                frame.save(f'process_img/frame_{idx}_{bbox_filepath}.png')
+            face_frames.append(self.pil_to_tensor(letterbox_to(*resize_wh, crop)))
+                 
+        # ---------- 5. 打包返回 ---------- #
+        # (F,C,H,W) → (C,F,H,W)
+        video_tensor = video_tensor.permute(1, 0, 2, 3).contiguous()
+        face_tensor = torch.stack(face_frames) if face_frames else None
+        if face_tensor is not None:
+            face_tensor = face_tensor.permute(1, 0, 2, 3).contiguous()
+
+        if not self.support_video:                       # 纯图像模型
+            return [(video_tensor.squeeze(0), mask, None)]
+        if not is_video:                                  # 单张图像走这里
+            return [(video_tensor, mask, face_tensor)]
+               
+        # 需要切 clip 的视频
+        vids, face_vids = extract_clips(video_tensor, face_tensor, frames_rounded, self.video_clip_mode)
+        if face_vids is not None:
+            return ([(v, mask) for v in vids],
+                    [(fv, mask) for fv in face_vids])
+        else:
+            return [(v, mask) for v in vids], None
+
 
 
 class BasePipeline:
